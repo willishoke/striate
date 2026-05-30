@@ -1,0 +1,8 @@
+# rendered artifacts (stills, frames, gifs, mp4s)
+outputs/
+
+# environments / caches
+.venv/
+__pycache__/
+*.pyc
+.DS_Store

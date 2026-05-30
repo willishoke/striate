@@ -1,0 +1,22 @@
+[project]
+name = "striate"
+version = "0.1.0"
+description = "Modern, hi-res feature visualization and temporal morphing -- a clean-room take on Distill 2017, pointed at a contemporary CNN."
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "pillow",
+    "tqdm",
+]
+
+[project.scripts]
+striate = "striate.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["striate"]
