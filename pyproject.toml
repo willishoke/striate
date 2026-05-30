@@ -9,6 +9,7 @@ dependencies = [
     "numpy",
     "pillow",
     "tqdm",
+    "timm>=1.0.27",
 ]
 
 [project.scripts]

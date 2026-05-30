@@ -37,8 +37,9 @@ class TransformRobustness:
         nh, nw = int(round(x.shape[2] * scale)), int(round(x.shape[3] * scale))
         x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
 
-        angle = random.choice(self.degrees)
-        x = TF.rotate(x, angle, interpolation=TF.InterpolationMode.BILINEAR)
+        if self.degrees:  # rotation is the lone grid_sample (CPU fallback on MPS); skippable
+            angle = random.choice(self.degrees)
+            x = TF.rotate(x, angle, interpolation=TF.InterpolationMode.BILINEAR)
 
         x = self._jitter(x, self.jitter // 2)
         return self._center_crop(x, h, w)
