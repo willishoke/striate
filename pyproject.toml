@@ -10,6 +10,8 @@ dependencies = [
     "pillow",
     "tqdm",
     "timm>=1.0.27",
+    "scikit-learn",
+    "spandrel",
 ]
 
 [project.scripts]
