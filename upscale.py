@@ -35,6 +35,7 @@ def main():
     ap.add_argument("--model", default="models/RealESRGAN_x4plus.pth")
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--gif", default=None)
+    ap.add_argument("--no-gif", action="store_true", help="only write frames (don't hold them all in memory)")
     args = ap.parse_args()
 
     dev = pick_device()
@@ -47,9 +48,13 @@ def main():
     for p in paths:
         out = upscale_image(model, Image.open(p), dev)
         out.save(f"{outdir}/{os.path.basename(p)}")
-        ups.append(out)
-    if not ups:
+        if not args.no_gif:
+            ups.append(out)
+    if not paths:
         print(f"no frames in {args.frames}")
+        return
+    if args.no_gif:
+        print(f"upscaled {len(paths)} frames x{model.scale} -> {out.size}  dir {outdir}/")
         return
 
     gif = args.gif or (args.frames.rstrip("/") + f"_x{model.scale}.gif")
