@@ -48,13 +48,18 @@ class InterpChannel:
 def run_morph(backbone, layer, ch_a, ch_b, t_schedule, *, width=1280, height=720,
               steps_per_frame=8, warmup=150, lr=0.05, device="cpu", coherent=True,
               batch=1, coherence_loss=0.0, clip_weight=0.0, freeze_cutoff=0.0,
-              freeze_width=0.03, seed=0, outdir=None, collect=False):
+              freeze_width=0.03, seed=0, outdir=None, collect=False, ema=0.0, adam_eps=1e-8):
     backbone.clear_hooks()
     backbone.hook(layer)
     transforms = TransformRobustness()
     param = FourierImage(height, width, device=device)
     obj = InterpChannel(layer, ch_a, ch_b)
-    optimizer = torch.optim.Adam([param.spectrum], lr=lr)
+    optimizer = torch.optim.Adam([param.spectrum], lr=lr, eps=adam_eps)
+
+    # Iterate averaging. Frames are rendered from an EMA of the spectrum rather
+    # than the raw Adam iterate, so per-step optimizer noise is low-passed in
+    # time instead of landing in every frame. Optimization itself is unchanged.
+    ema_spec = param.spectrum.detach().clone() if ema > 0.0 else None
 
     # Soft low-frequency freeze. A per-frequency gain (sigmoid in radial
     # frequency) that throttles *updates* to the lowest frequencies during the
@@ -84,11 +89,15 @@ def run_morph(backbone, layer, ch_a, ch_b, t_schedule, *, width=1280, height=720
         if freezing and freeze_mask is not None:
             param.spectrum.grad.mul_(freeze_mask)  # throttle low-freq updates
         optimizer.step()
+        if ema_spec is not None:
+            ema_spec.mul_(ema).add_(param.spectrum.detach(), alpha=1.0 - ema)
 
     obj.t = float(t_schedule[0])
     for _ in range(warmup):  # warmup optimizes ALL frequencies (establishes the field)
         step(None)
     freezing = True  # from here on, the lowest frequencies are soft-frozen
+    if ema_spec is not None:
+        ema_spec.copy_(param.spectrum.detach())  # start the average at the warmed-up image
 
     if outdir:
         os.makedirs(outdir, exist_ok=True)
@@ -106,8 +115,8 @@ def run_morph(backbone, layer, ch_a, ch_b, t_schedule, *, width=1280, height=720
         for _ in range(steps_per_frame):
             step(target)
         cur = param.preact().detach()
-        img = torch.sigmoid(cur)
-        prev2, prev = prev, cur  # roll the two-frame pre-sigmoid history
+        img = torch.sigmoid(cur if ema_spec is None else param.preact(ema_spec).detach())
+        prev2, prev = prev, cur  # roll the two-frame pre-sigmoid history (raw iterate)
         if outdir:
             save_image(img, f"{outdir}/frame_{i:04d}.png")
         if collect:
@@ -172,6 +181,8 @@ def main():
     p.add_argument("--adaptive-pacing", action="store_true")
     p.add_argument("--freeze-cutoff", type=float, default=0.0, help="soft low-freq freeze cutoff (radial freq); 0=off")
     p.add_argument("--freeze-width", type=float, default=0.03)
+    p.add_argument("--ema", type=float, default=0.0, help="render frames from an EMA of the iterate (decay per step); 0=off")
+    p.add_argument("--adam-eps", type=float, default=1e-8)
     p.add_argument("--outdir", default="outputs/morph_frames")
     p.add_argument("--strip", default="outputs/morph_strip.png")
     args = p.parse_args()
@@ -196,7 +207,8 @@ def main():
               warmup=args.warmup, lr=0.05, device=device,
               coherent=not args.no_coherent, batch=args.transform_batch,
               coherence_loss=args.coherence_loss, freeze_cutoff=args.freeze_cutoff,
-              freeze_width=args.freeze_width, outdir=args.outdir)
+              freeze_width=args.freeze_width, outdir=args.outdir, ema=args.ema,
+              adam_eps=args.adam_eps)
     strip(args.outdir, args.frames, args.strip)
     print(f"done in {time.time() - t0:.0f}s  frames -> {args.outdir}  strip -> {args.strip}")
 

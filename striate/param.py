@@ -72,12 +72,16 @@ class FourierImage(torch.nn.Module):
         self.spectrum = torch.nn.Parameter(init)
         self.to(device)
 
-    def preact(self) -> torch.Tensor:
+    def preact(self, spectrum: torch.Tensor | None = None) -> torch.Tensor:
         """The pre-sigmoid (decorrelated) image -- unbounded; the sigmoid squashes
         this into [0, 1]. Temporal smoothness penalties belong here, not on the
         squashed output: in this space there are no [0, 1] rails to clip against.
+
+        ``spectrum`` renders another spectrum of the same shape (e.g. an EMA of
+        the parameter) instead of ``self.spectrum``.
         """
-        scaled = self.spectrum * self.spectrum_scale
+        spectrum = self.spectrum if spectrum is None else spectrum
+        scaled = spectrum * self.spectrum_scale
         complex_spectrum = torch.view_as_complex(scaled.contiguous())
         image = torch.fft.irfftn(
             complex_spectrum, s=(self.height, self.width), dim=(2, 3)
