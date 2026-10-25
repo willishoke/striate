@@ -58,9 +58,13 @@ def main():
         t0 = time.time()
         objective = ChannelObjective(args.layer, ch)
         image = render_progressive(
-            backbone, objective, [args.layer],
-            sizes=[(args.height, args.width)], steps=args.steps,
-            device=device, progress=False,
+            backbone,
+            objective,
+            [args.layer],
+            sizes=[(args.height, args.width)],
+            steps=args.steps,
+            device=device,
+            progress=False,
         )
         path = f"outputs/sweep/{args.layer.replace('.', '-')}_ch{ch}.png"
         save_image(image, path)

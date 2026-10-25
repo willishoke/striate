@@ -19,7 +19,15 @@ from striate.transforms import TransformRobustness
 from striate.util import pick_device, save_image
 from keyframe import render_spectra
 from make_corpus import render_group
-from morph_critic import Critic, desmear_sequence_fb, comparison_strip, save_gif, to_pil, prep, CRIT_SIZE
+from morph_critic import (
+    Critic,
+    desmear_sequence_fb,
+    comparison_strip,
+    save_gif,
+    to_pil,
+    prep,
+    CRIT_SIZE,
+)
 from morph_sweep import jitter_motion
 
 
@@ -52,31 +60,64 @@ def main():
     transforms = TransformRobustness(degrees=[])
     bb = Backbone("tiny", device=dev)
     la, lb = args.from_layer or args.layer, args.to_layer or args.layer
-    sub_a = bb.model.features[:int(la.split(".")[1]) + 1]
-    sub_b = bb.model.features[:int(lb.split(".")[1]) + 1]
-    print(f"hires {args.size}px  {la}:{args.from_ch} -> {lb}:{args.to_ch}  frames={args.frames} "
-          f"proj-steps={args.proj_steps} endpoint-steps={args.endpoint_steps}")
+    sub_a = bb.model.features[: int(la.split(".")[1]) + 1]
+    sub_b = bb.model.features[: int(lb.split(".")[1]) + 1]
+    print(
+        f"hires {args.size}px  {la}:{args.from_ch} -> {lb}:{args.to_ch}  frames={args.frames} "
+        f"proj-steps={args.proj_steps} endpoint-steps={args.endpoint_steps}"
+    )
 
     t0 = time.perf_counter()
-    sA = render_group(bb, sub_a, [args.from_ch], size=args.size, steps=args.endpoint_steps,
-                      lr=0.05, transforms=transforms, device=dev)
-    sB = render_group(bb, sub_b, [args.to_ch], size=args.size, steps=args.endpoint_steps,
-                      lr=0.05, transforms=transforms, device=dev)
+    sA = render_group(
+        bb,
+        sub_a,
+        [args.from_ch],
+        size=args.size,
+        steps=args.endpoint_steps,
+        lr=0.05,
+        transforms=transforms,
+        device=dev,
+    )
+    sB = render_group(
+        bb,
+        sub_b,
+        [args.to_ch],
+        size=args.size,
+        steps=args.endpoint_steps,
+        lr=0.05,
+        transforms=transforms,
+        device=dev,
+    )
     ep = torch.cat([sA, sB], dim=0).to(dev)
     t_ep = time.perf_counter() - t0
-    print(f"  endpoints: {t_ep:5.1f}s  ({t_ep / (2 * args.endpoint_steps) * 1000:.0f} ms/step, 2x batch-1)")
+    print(
+        f"  endpoints: {t_ep:5.1f}s  ({t_ep / (2 * args.endpoint_steps) * 1000:.0f} ms/step, 2x batch-1)"
+    )
 
     sA, sB = ep[0:1], ep[1:2]
     ts = torch.linspace(0, 1, args.frames)
     dense = torch.cat([((1 - t) * sA + t * sB).cpu() for t in ts], dim=0)
 
     t1 = time.perf_counter()
-    des_spec = desmear_sequence_fb(dense, critic, size=args.size, lam=args.lam, anchor_lo=args.anchor_lo,
-                                   temporal_hi=args.temporal_hi, anchor_hi=0.0, k=args.k,
-                                   steps=args.proj_steps, lr=args.proj_lr, transforms=transforms, device=dev)
+    des_spec = desmear_sequence_fb(
+        dense,
+        critic,
+        size=args.size,
+        lam=args.lam,
+        anchor_lo=args.anchor_lo,
+        temporal_hi=args.temporal_hi,
+        anchor_hi=0.0,
+        k=args.k,
+        steps=args.proj_steps,
+        lr=args.proj_lr,
+        transforms=transforms,
+        device=dev,
+    )
     t_des = time.perf_counter() - t1
     nstep = args.frames * args.proj_steps
-    print(f"  de-smear:  {t_des:5.1f}s  ({t_des / nstep * 1000:.0f} ms/frame-step over {nstep} steps)")
+    print(
+        f"  de-smear:  {t_des:5.1f}s  ({t_des / nstep * 1000:.0f} ms/frame-step over {nstep} steps)"
+    )
 
     t2 = time.perf_counter()
     base_imgs = render_spectra(dense, args.size, args.size, dev, chunk=4)
@@ -86,8 +127,10 @@ def main():
     def mid_critic(imgs):
         mid = range(args.frames // 4, 3 * args.frames // 4)
         with torch.no_grad():
-            return sum(torch.sigmoid(critic(prep(imgs[i][None].to(dev), CRIT_SIZE, transforms))).item()
-                       for i in mid) / max(1, len(list(mid)))
+            return sum(
+                torch.sigmoid(critic(prep(imgs[i][None].to(dev), CRIT_SIZE, transforms))).item()
+                for i in mid
+            ) / max(1, len(list(mid)))
 
     bj, bd = jitter_motion(base_imgs)
     dj, dd = jitter_motion(des_imgs)

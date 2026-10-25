@@ -55,7 +55,7 @@ def nn_tour(feat):
 
 def loop_path(spectra_ordered, M):
     K = spectra_ordered.shape[0]
-    seq = torch.cat([spectra_ordered, spectra_ordered[:1]], dim=0)       # close the loop
+    seq = torch.cat([spectra_ordered, spectra_ordered[:1]], dim=0)  # close the loop
     out = []
     for m in range(M):
         u = (m / M) * K
@@ -70,7 +70,7 @@ def loop_path_polar(spectra_ordered, M):
     shortest arc. Phase carries spatial position (shift theorem), so moving it makes
     features FLOW through space (fundamental shifting) instead of cross-fading in place."""
     K = spectra_ordered.shape[0]
-    c = torch.view_as_complex(spectra_ordered.contiguous())             # (K,3,H,Wf) complex
+    c = torch.view_as_complex(spectra_ordered.contiguous())  # (K,3,H,Wf) complex
     seq = torch.cat([c, c[:1]], dim=0)
     out = []
     for m in range(M):
@@ -79,7 +79,7 @@ def loop_path_polar(spectra_ordered, M):
         t = u - i
         a = (1 - t) * seq[i].abs() + t * seq[i + 1].abs()
         dphi = seq[i + 1].angle() - seq[i].angle()
-        dphi = (dphi + math.pi) % (2 * math.pi) - math.pi               # shortest arc
+        dphi = (dphi + math.pi) % (2 * math.pi) - math.pi  # shortest arc
         phi = seq[i].angle() + t * dphi
         out.append(torch.view_as_real(a * torch.exp(1j * phi)))
     return torch.stack(out)
@@ -94,24 +94,41 @@ def add_phase_flow(dense, flow_mag, cutoff, cycles, height, width):
     M = dense.shape[0]
     fy = torch.fft.fftfreq(height)[:, None]
     fx = torch.fft.rfftfreq(width)[None, :]
-    f = torch.sqrt(fx ** 2 + fy ** 2)
-    loww = torch.exp(-(f / cutoff) ** 2)                       # emphasize low freq (large-scale flow)
-    c = torch.view_as_complex(dense.contiguous())             # (M,3,H,Wf)
+    f = torch.sqrt(fx**2 + fy**2)
+    loww = torch.exp(-((f / cutoff) ** 2))  # emphasize low freq (large-scale flow)
+    c = torch.view_as_complex(dense.contiguous())  # (M,3,H,Wf)
     out = []
     for m in range(M):
         t = m / M
         dx = flow_mag * (math.cos(2 * math.pi * cycles * t) - 1)
         dy = flow_mag * math.sin(2 * math.pi * cycles * t)
-        ramp = 2 * math.pi * (fx * dx + fy * dy) * loww        # (H, Wf) phase offset
+        ramp = 2 * math.pi * (fx * dx + fy * dy) * loww  # (H, Wf) phase offset
         out.append(torch.view_as_real(c[m] * torch.exp(1j * ramp)))
     return torch.stack(out)
 
 
-def swim_sequence(dense, disc, bb, sub, channel, *, size, lam_disc, lam_chan, anchor_lo,
-                  temporal_hi, k, steps, lr, transforms, disc_aug, device):
+def swim_sequence(
+    dense,
+    disc,
+    bb,
+    sub,
+    channel,
+    *,
+    size,
+    lam_disc,
+    lam_chan,
+    anchor_lo,
+    temporal_hi,
+    k,
+    steps,
+    lr,
+    transforms,
+    disc_aug,
+    device,
+):
     out, prev_spec, prev_hi = [], None, None
     for fi in range(dense.shape[0]):
-        interp = dense[fi:fi + 1].to(device)
+        interp = dense[fi : fi + 1].to(device)
         interp_lo = _lowpass(render_one(interp, size, device), k)
         param = FourierImage(size, size, device=device)
         with torch.no_grad():
@@ -122,9 +139,11 @@ def swim_sequence(dense, disc, bb, sub, channel, *, size, lam_disc, lam_chan, an
             img = param.to_image()
             act = sub(bb.normalize(transforms(img)))
             lo = _lowpass(img, k)
-            loss = (lam_disc * torch.sigmoid(disc(prep(img, CRIT_SIZE, disc_aug)))
-                    - lam_chan * act[:, channel].mean()
-                    + anchor_lo * ((lo - interp_lo) ** 2).mean())
+            loss = (
+                lam_disc * torch.sigmoid(disc(prep(img, CRIT_SIZE, disc_aug)))
+                - lam_chan * act[:, channel].mean()
+                + anchor_lo * ((lo - interp_lo) ** 2).mean()
+            )
             if temporal_hi > 0 and prev_hi is not None:
                 loss = loss + temporal_hi * (((img - lo) - prev_hi) ** 2).mean()
             loss.backward()
@@ -152,11 +171,23 @@ def main():
     ap.add_argument("--k", type=int, default=8)
     ap.add_argument("--proj-lr", type=float, default=0.03)
     ap.add_argument("--interp", default="linear", choices=["linear", "polar"])
-    ap.add_argument("--flow-mag", type=float, default=0.0, help="phase-flow drift magnitude (px); 0=off")
-    ap.add_argument("--flow-cutoff", type=float, default=0.12, help="low-freq cutoff for the flow band")
+    ap.add_argument(
+        "--flow-mag", type=float, default=0.0, help="phase-flow drift magnitude (px); 0=off"
+    )
+    ap.add_argument(
+        "--flow-cutoff", type=float, default=0.12, help="low-freq cutoff for the flow band"
+    )
     ap.add_argument("--flow-cycles", type=float, default=1.0, help="flow orbits over the loop")
-    ap.add_argument("--no-desmear", action="store_true", help="just render the interpolated path (no disc projection)")
-    ap.add_argument("--keyframes-only", action="store_true", help="render just the sharp facet waypoints (for flow-interp)")
+    ap.add_argument(
+        "--no-desmear",
+        action="store_true",
+        help="just render the interpolated path (no disc projection)",
+    )
+    ap.add_argument(
+        "--keyframes-only",
+        action="store_true",
+        help="render just the sharp facet waypoints (for flow-interp)",
+    )
     ap.add_argument("--tag", default="swim_l3_84")
     args = ap.parse_args()
 
@@ -165,14 +196,16 @@ def main():
     spectra, size, layer = blob["spectra"].to(dev), blob["size"], blob["layer"]
     N = spectra.shape[0]
     bb = Backbone("tiny", device=dev)
-    sub = bb.model.features[:int(layer.split(".")[1]) + 1]
+    sub = bb.model.features[: int(layer.split(".")[1]) + 1]
     disc = Critic().to(dev)
     disc.load_state_dict(torch.load(args.disc))
     disc.eval()
     for p in disc.parameters():
         p.requires_grad_(False)
     transforms = TransformRobustness(degrees=[])
-    disc_aug = OrbitAugment(crop=CRIT_SIZE, degrees=0, translate=0)   # disc-eval crop-matches training FOV
+    disc_aug = OrbitAugment(
+        crop=CRIT_SIZE, degrees=0, translate=0
+    )  # disc-eval crop-matches training FOV
 
     fp = FourierImage(size, size, batch=N, device=dev)
     with torch.no_grad():
@@ -182,7 +215,7 @@ def main():
     tour = nn_tour(squint[sel])
     waypoints = [sel[t] for t in tour]
     if args.keyframes_only:
-        seq = waypoints + [waypoints[0]]                      # loop closure
+        seq = waypoints + [waypoints[0]]  # loop closure
         kf = render_spectra(spectra[seq].cpu(), size, size, dev, chunk=6)
         fdir = f"outputs/{args.tag}_keyframes"
         os.makedirs(fdir, exist_ok=True)
@@ -195,8 +228,10 @@ def main():
     dense = interp_fn(spectra[waypoints].cpu(), args.frames)
     if args.flow_mag > 0:
         dense = add_phase_flow(dense, args.flow_mag, args.flow_cutoff, args.flow_cycles, size, size)
-    print(f"swim {layer}:{args.channel}  {len(waypoints)} tight waypoints -> {args.frames}-frame {args.interp} loop "
-          f"({args.frames // len(waypoints)}/seg) @ {size}px  idx={waypoints}")
+    print(
+        f"swim {layer}:{args.channel}  {len(waypoints)} tight waypoints -> {args.frames}-frame {args.interp} loop "
+        f"({args.frames // len(waypoints)}/seg) @ {size}px  idx={waypoints}"
+    )
 
     base = render_spectra(dense, size, size, dev, chunk=6)
 
@@ -206,28 +241,54 @@ def main():
         os.makedirs(fdir, exist_ok=True)
         for i in range(base.shape[0]):
             to_pil(base[i]).save(f"{fdir}/f{i:04d}.png")
-        idxs = [round(k * (args.frames - 1) / 5) for k in range(6)]   # spread across the loop
+        idxs = [round(k * (args.frames - 1) / 5) for k in range(6)]  # spread across the loop
         sheet = Image.new("RGB", (3 * size, 2 * size), (12, 12, 12))
         for n, i in enumerate(idxs):
             sheet.paste(to_pil(base[i]), ((n % 3) * size, (n // 3) * size))
         sheet.save(f"outputs/{args.tag}_spread.png")
-        print(f"{args.interp} path (no de-smear)  jitter={jitter(base):.3f}  "
-              f"-> outputs/{args.tag}.gif, {fdir}/ ({base.shape[0]} frames), {args.tag}_spread.png")
+        print(
+            f"{args.interp} path (no de-smear)  jitter={jitter(base):.3f}  "
+            f"-> outputs/{args.tag}.gif, {fdir}/ ({base.shape[0]} frames), {args.tag}_spread.png"
+        )
         return
-    swam_spec = swim_sequence(dense, disc, bb, sub, args.channel, size=size, lam_disc=args.lam_disc,
-                              lam_chan=args.lam_chan, anchor_lo=args.anchor_lo, temporal_hi=args.temporal_hi,
-                              k=args.k, steps=args.proj_steps, lr=args.proj_lr, transforms=transforms,
-                              disc_aug=disc_aug, device=dev)
+    swam_spec = swim_sequence(
+        dense,
+        disc,
+        bb,
+        sub,
+        args.channel,
+        size=size,
+        lam_disc=args.lam_disc,
+        lam_chan=args.lam_chan,
+        anchor_lo=args.anchor_lo,
+        temporal_hi=args.temporal_hi,
+        k=args.k,
+        steps=args.proj_steps,
+        lr=args.proj_lr,
+        transforms=transforms,
+        disc_aug=disc_aug,
+        device=dev,
+    )
     swam = render_spectra(swam_spec, size, size, dev, chunk=6)
 
     def disc_score(imgs, n=8):
         idx = [round(i * (imgs.shape[0] - 1) / (n - 1)) for i in range(n)]
         with torch.no_grad():
-            return float(np.mean([torch.sigmoid(disc(prep(imgs[i][None].to(dev), CRIT_SIZE, disc_aug))).item()
-                                  for i in idx]))
+            return float(
+                np.mean(
+                    [
+                        torch.sigmoid(disc(prep(imgs[i][None].to(dev), CRIT_SIZE, disc_aug))).item()
+                        for i in idx
+                    ]
+                )
+            )
 
-    print(f"  baseline (raw tour): jitter={jitter(base):.3f}  on-manifold(disc)={disc_score(base):.2f}")
-    print(f"  swim:                jitter={jitter(swam):.3f}  on-manifold(disc)={disc_score(swam):.2f}")
+    print(
+        f"  baseline (raw tour): jitter={jitter(base):.3f}  on-manifold(disc)={disc_score(base):.2f}"
+    )
+    print(
+        f"  swim:                jitter={jitter(swam):.3f}  on-manifold(disc)={disc_score(swam):.2f}"
+    )
 
     save_gif(base, f"outputs/{args.tag}_base.gif", 20)
     save_gif(swam, f"outputs/{args.tag}.gif", 20)

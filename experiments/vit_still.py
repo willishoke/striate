@@ -34,16 +34,21 @@ def main():
     args = ap.parse_args()
 
     dev = pick_device()
-    model = timm.create_model(args.model, pretrained=True, num_classes=0,
-                              dynamic_img_size=True).eval().to(dev)
+    model = (
+        timm.create_model(args.model, pretrained=True, num_classes=0, dynamic_img_size=True)
+        .eval()
+        .to(dev)
+    )
     for p in model.parameters():
         p.requires_grad_(False)
     cfg = timm.data.resolve_model_data_config(model)
     mean = torch.tensor(cfg["mean"]).view(1, 3, 1, 1).to(dev)
     std = torch.tensor(cfg["std"]).view(1, 3, 1, 1).to(dev)
     gh, gw = args.height // 16, args.width // 16
-    print(f"device {dev}  {args.model}  block {args.block}  ch {args.channel}  "
-          f"@ {args.width}x{args.height}  token grid {gh}x{gw}")
+    print(
+        f"device {dev}  {args.model}  block {args.block}  ch {args.channel}  "
+        f"@ {args.width}x{args.height}  token grid {gh}x{gw}"
+    )
 
     cap = {}
     handle = model.blocks[args.block].register_forward_hook(lambda m, i, o: cap.__setitem__("t", o))
@@ -56,8 +61,8 @@ def main():
         img = param.to_image()
         model.forward_features((transforms(img) - mean) / std)
         tok = cap["t"]
-        if tok.shape[1] != gh * gw:                  # strip any leading CLS/registers
-            tok = tok[:, tok.shape[1] - gh * gw:, :]
+        if tok.shape[1] != gh * gw:  # strip any leading CLS/registers
+            tok = tok[:, tok.shape[1] - gh * gw :, :]
         act = tok.reshape(tok.shape[0], gh, gw, tok.shape[-1]).permute(0, 3, 1, 2)
         (-act[:, args.channel].mean()).backward()
         opt.step()

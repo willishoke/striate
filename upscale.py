@@ -22,7 +22,10 @@ from striate.util import pick_device
 
 
 def upscale_image(model, im, device):
-    x = torch.from_numpy(np.array(im.convert("RGB"))).permute(2, 0, 1)[None].float().to(device) / 255.0
+    x = (
+        torch.from_numpy(np.array(im.convert("RGB"))).permute(2, 0, 1)[None].float().to(device)
+        / 255.0
+    )
     with torch.no_grad():
         y = model(x)
     arr = (y[0].clamp(0, 1).permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
@@ -35,7 +38,9 @@ def main():
     ap.add_argument("--model", default="models/RealESRGAN_x4plus.pth")
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--gif", default=None)
-    ap.add_argument("--no-gif", action="store_true", help="only write frames (don't hold them all in memory)")
+    ap.add_argument(
+        "--no-gif", action="store_true", help="only write frames (don't hold them all in memory)"
+    )
     args = ap.parse_args()
 
     dev = pick_device()

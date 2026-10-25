@@ -29,14 +29,21 @@ from striate.param import FourierImage
 from striate.util import pick_device
 from facets import gram_vecs
 
-PALETTE = [(255, 90, 90), (90, 170, 255), (110, 230, 110), (255, 210, 80), (210, 120, 255), (120, 230, 230)]
+PALETTE = [
+    (255, 90, 90),
+    (90, 170, 255),
+    (110, 230, 110),
+    (255, 210, 80),
+    (210, 120, 255),
+    (120, 230, 230),
+]
 NOISE = (110, 110, 110)
 
 
 def pca(X, q):
     Xc = X - X.mean(0, keepdim=True)
     _, _, Vh = torch.linalg.svd(Xc, full_matrices=False)
-    return Xc @ Vh[:min(q, Vh.shape[0])].t()
+    return Xc @ Vh[: min(q, Vh.shape[0])].t()
 
 
 def zscore(X):
@@ -56,22 +63,33 @@ def main():
 
     dev = pick_device()
     blob = torch.load(args.facets, weights_only=False)
-    spectra, size, layer, chans = blob["spectra"].to(dev), blob["size"], blob["layer"], blob["channels"]
+    spectra, size, layer, chans = (
+        blob["spectra"].to(dev),
+        blob["size"],
+        blob["layer"],
+        blob["channels"],
+    )
     N = spectra.shape[0]
     bb = Backbone("tiny", device=dev)
-    sub = bb.model.features[:int(layer.split(".")[1]) + 1]
+    sub = bb.model.features[: int(layer.split(".")[1]) + 1]
 
     fp = FourierImage(size, size, batch=N, device=dev)
     with torch.no_grad():
         fp.spectrum.copy_(spectra)
         imgs = fp.to_image()
-        squint = F.interpolate(imgs, size=(args.squint, args.squint), mode="area").reshape(N, -1).cpu()
+        squint = (
+            F.interpolate(imgs, size=(args.squint, args.squint), mode="area").reshape(N, -1).cpu()
+        )
         gram = gram_vecs(sub(bb.normalize(imgs))).cpu()
     imgs = imgs.cpu()
 
-    feat = torch.cat([zscore(pca(squint, args.pca_dims)), zscore(pca(gram, args.pca_dims))], dim=1).numpy()
+    feat = torch.cat(
+        [zscore(pca(squint, args.pca_dims)), zscore(pca(gram, args.pca_dims))], dim=1
+    ).numpy()
     lab = HDBSCAN(min_cluster_size=args.min_cluster, min_samples=args.min_samples).fit_predict(feat)
-    emb = TSNE(n_components=2, perplexity=min(12, (N - 1) // 3), init="pca", random_state=0).fit_transform(feat)
+    emb = TSNE(
+        n_components=2, perplexity=min(12, (N - 1) // 3), init="pca", random_state=0
+    ).fit_transform(feat)
 
     ids = sorted(set(lab))
     sizes = {c: int((lab == c).sum()) for c in ids}
@@ -81,8 +99,15 @@ def main():
     if core_ids:
         core = max(core_ids, key=lambda c: sizes[c])
         order = [i for i in range(N) if lab[i] == core]
-        torch.save({"spectra": spectra[order].cpu(), "channels": [chans[0]] * len(order),
-                    "size": size, "layer": layer}, args.core_out)
+        torch.save(
+            {
+                "spectra": spectra[order].cpu(),
+                "channels": [chans[0]] * len(order),
+                "size": size,
+                "layer": layer,
+            },
+            args.core_out,
+        )
         print(f"  core = cluster {core} ({len(order)} facets) -> {args.core_out}  idx={order}")
 
     torch.save({"labels": torch.tensor(lab), "emb": torch.tensor(emb)}, args.out)
@@ -100,8 +125,9 @@ def main():
     scat.save(args.out.replace(".pt", "_scatter.png"))
 
     # grouped sheet (clusters first, noise last)
-    groups = [(c, [i for i in range(N) if lab[i] == c]) for c in core_ids] + \
-             ([(-1, [i for i in range(N) if lab[i] == -1])] if -1 in ids else [])
+    groups = [(c, [i for i in range(N) if lab[i] == c]) for c in core_ids] + (
+        [(-1, [i for i in range(N) if lab[i] == -1])] if -1 in ids else []
+    )
     cols = max(len(m) for _, m in groups)
     T, band = 120, 18
     sheet = Image.new("RGB", (cols * T, len(groups) * (T + band)), (12, 12, 12))
@@ -109,13 +135,19 @@ def main():
     for r, (c, members) in enumerate(groups):
         top = r * (T + band)
         col = NOISE if c == -1 else PALETTE[c % len(PALETTE)]
-        d.text((6, top + 3), f"{'halo/noise' if c == -1 else f'cluster {c}'} (n={len(members)})", fill=col)
+        d.text(
+            (6, top + 3),
+            f"{'halo/noise' if c == -1 else f'cluster {c}'} (n={len(members)})",
+            fill=col,
+        )
         for cc, i in enumerate(members):
             a = (imgs[i].clamp(0, 1).permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             sheet.paste(Image.fromarray(a).resize((T, T)), (cc * T, top + band))
             d.text((cc * T + 3, top + band + 1), f"{i}", fill=(255, 255, 0))
     sheet.save(args.out.replace(".pt", ".png"))
-    print(f"{N} facets  scatter -> {args.out.replace('.pt', '_scatter.png')}  sheet -> {args.out.replace('.pt', '.png')}")
+    print(
+        f"{N} facets  scatter -> {args.out.replace('.pt', '_scatter.png')}  sheet -> {args.out.replace('.pt', '.png')}"
+    )
 
 
 if __name__ == "__main__":

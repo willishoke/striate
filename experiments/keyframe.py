@@ -30,15 +30,32 @@ from striate.transforms import TransformRobustness
 from striate.util import pick_device, save_image
 
 
-def optimize_keyframes(bb, layer, ch_a, ch_b, *, K, height, width, steps, align_weight,
-                       hf_smooth, hf_cutoff, hf_width, lr, device, segments=0, rotate=True):
+def optimize_keyframes(
+    bb,
+    layer,
+    ch_a,
+    ch_b,
+    *,
+    K,
+    height,
+    width,
+    steps,
+    align_weight,
+    hf_smooth,
+    hf_cutoff,
+    hf_width,
+    lr,
+    device,
+    segments=0,
+    rotate=True,
+):
     idx = int(layer.split(".")[1])
     # Flatten to per-block granularity: each stage is a Sequential of CNBlocks;
     # checkpointing at the block level (not the top level) is what actually cuts
     # the peak, since stage 3 alone is 9 blocks. CNBlocks keep their internal
     # residual intact -- we only flatten the Sequential grouping, not the blocks.
     blocks = []
-    for m in bb.model.features[:idx + 1]:
+    for m in bb.model.features[: idx + 1]:
         blocks.extend(list(m.children()))
     sub = torch.nn.Sequential(*blocks)
     seg = min(segments, len(blocks)) if segments > 0 else 0
@@ -49,7 +66,9 @@ def optimize_keyframes(bb, layer, ch_a, ch_b, *, K, height, width, steps, align_
     hp = 1.0 / (1.0 + np.exp(-(f - hf_cutoff) / hf_width))
     hp_mask = torch.tensor(hp, dtype=torch.float32, device=device)[None, None, ..., None]
     t = torch.linspace(0, 1, K, device=device)
-    transforms = TransformRobustness(degrees=None if rotate else [])  # rotation = CPU-fallback grid_sample
+    transforms = TransformRobustness(
+        degrees=None if rotate else []
+    )  # rotation = CPU-fallback grid_sample
     opt = torch.optim.Adam([param.spectrum], lr=lr)
     for _ in trange(steps, desc="keyframes", leave=False):
         opt.zero_grad()
@@ -62,7 +81,7 @@ def optimize_keyframes(bb, layer, ch_a, ch_b, *, K, height, width, steps, align_
         loss = loss + align_weight * ((images[1:] - images[:-1]) ** 2).mean()
         if hf_smooth > 0:
             dspec = param.spectrum[1:] - param.spectrum[:-1]
-            loss = loss + hf_smooth * (hp_mask * dspec ** 2).mean()
+            loss = loss + hf_smooth * (hp_mask * dspec**2).mean()
         loss.backward()
         opt.step()
     return param.spectrum.detach()
@@ -71,6 +90,7 @@ def optimize_keyframes(bb, layer, ch_a, ch_b, *, K, height, width, steps, align_
 def _cr_point(p0, p1, p2, p3, local, alpha=0.5, eps=1e-5):
     def dt(a, b):
         return max((((b - a) ** 2).sum().sqrt().item()) ** alpha, eps)
+
     t0 = 0.0
     t1 = t0 + dt(p0, p1)
     t2 = t1 + dt(p1, p2)
@@ -101,7 +121,7 @@ def catmull_rom(keyframes, M, alpha=0.5):
 def render_spectra(spectra, height, width, device, chunk=8):
     out = []
     for s in range(0, spectra.shape[0], chunk):
-        fb = spectra[s:s + chunk].to(device)
+        fb = spectra[s : s + chunk].to(device)
         param = FourierImage(height, width, batch=fb.shape[0], device=device)
         with torch.no_grad():
             param.spectrum.copy_(fb)
@@ -120,7 +140,9 @@ def main():
     ap.add_argument("--height", type=int, default=1080)
     ap.add_argument("--steps", type=int, default=150)
     ap.add_argument("--segments", type=int, default=4, help="gradient-checkpoint segments (0=off)")
-    ap.add_argument("--no-rotate", action="store_true", help="drop rotation (the lone CPU-fallback grid_sample)")
+    ap.add_argument(
+        "--no-rotate", action="store_true", help="drop rotation (the lone CPU-fallback grid_sample)"
+    )
     ap.add_argument("--align-weight", type=float, default=10.0)
     ap.add_argument("--hf-smooth", type=float, default=100.0)
     ap.add_argument("--hf-cutoff", type=float, default=0.25)
@@ -132,19 +154,34 @@ def main():
 
     dev = pick_device()
     bb = Backbone("tiny", device=dev)
-    print(f"{args.keyframes} keyframes @ {args.width}x{args.height} (ckpt segments={args.segments}) "
-          f"-> Catmull-Rom densify to {args.frames}")
-    kf = optimize_keyframes(bb, args.layer, args.from_ch, args.to_ch, K=args.keyframes,
-                            height=args.height, width=args.width, steps=args.steps,
-                            align_weight=args.align_weight, hf_smooth=args.hf_smooth,
-                            hf_cutoff=args.hf_cutoff, hf_width=args.hf_width, lr=args.lr,
-                            device=dev, segments=args.segments, rotate=not args.no_rotate)
+    print(
+        f"{args.keyframes} keyframes @ {args.width}x{args.height} (ckpt segments={args.segments}) "
+        f"-> Catmull-Rom densify to {args.frames}"
+    )
+    kf = optimize_keyframes(
+        bb,
+        args.layer,
+        args.from_ch,
+        args.to_ch,
+        K=args.keyframes,
+        height=args.height,
+        width=args.width,
+        steps=args.steps,
+        align_weight=args.align_weight,
+        hf_smooth=args.hf_smooth,
+        hf_cutoff=args.hf_cutoff,
+        hf_width=args.hf_width,
+        lr=args.lr,
+        device=dev,
+        segments=args.segments,
+        rotate=not args.no_rotate,
+    )
     dense = catmull_rom(kf.cpu(), args.frames)
     imgs = render_spectra(dense, args.height, args.width, dev)
 
     os.makedirs(args.outdir, exist_ok=True)
     for i in range(imgs.shape[0]):
-        save_image(imgs[i:i + 1], f"{args.outdir}/frame_{i:04d}.png")
+        save_image(imgs[i : i + 1], f"{args.outdir}/frame_{i:04d}.png")
 
     arr = [imgs[i].permute(1, 2, 0).numpy() for i in range(imgs.shape[0])]
     L = np.stack([0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2] for a in arr])
@@ -152,8 +189,13 @@ def main():
 
     pil = [Image.open(f"{args.outdir}/frame_{i:04d}.png") for i in range(imgs.shape[0])]
     loop = pil + pil[-2:0:-1]
-    loop[0].save("outputs/keyframe.gif", save_all=True, append_images=loop[1:],
-                 duration=1000 // args.fps, loop=0)
+    loop[0].save(
+        "outputs/keyframe.gif",
+        save_all=True,
+        append_images=loop[1:],
+        duration=1000 // args.fps,
+        loop=0,
+    )
 
     tw = 300
     th = round(tw * args.height / args.width)
@@ -165,7 +207,9 @@ def main():
         d.rectangle([c * tw + 4, 4, c * tw + 60, 22], fill=(0, 0, 0))
         d.text((c * tw + 8, 8), f"f{idx}", fill=(255, 255, 0))
     sheet.save("outputs/keyframe_strip.png")
-    print(f"done: {len(pil)} frames, jitter/motion={jm:.2f} -> outputs/keyframe.gif + keyframe_strip.png")
+    print(
+        f"done: {len(pil)} frames, jitter/motion={jm:.2f} -> outputs/keyframe.gif + keyframe_strip.png"
+    )
 
 
 if __name__ == "__main__":

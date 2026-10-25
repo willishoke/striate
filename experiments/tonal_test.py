@@ -16,8 +16,12 @@ from striate.util import pick_device, save_image
 
 def hist(t):
     a = t[0].permute(1, 2, 0).cpu().numpy()
-    return ((a < 0.02).mean() * 100, (a > 0.98).mean() * 100,
-            ((a > 0.2) & (a < 0.8)).mean() * 100, float(a.std()))
+    return (
+        (a < 0.02).mean() * 100,
+        (a > 0.98).mean() * 100,
+        ((a > 0.2) & (a < 0.8)).mean() * 100,
+        float(a.std()),
+    )
 
 
 dev = pick_device()
@@ -26,11 +30,22 @@ configs = [("baseline", 0.0), ("clip5", 5.0), ("clip20", 20.0), ("clip60", 60.0)
 entries = []
 for name, cw in configs:
     obj = ChannelObjective("features.7", 100)
-    img = render(bb, obj, ["features.7"], size=512, steps=300, lr=0.05,
-                 device=dev, clip_weight=cw, progress=False)
+    img = render(
+        bb,
+        obj,
+        ["features.7"],
+        size=512,
+        steps=300,
+        lr=0.05,
+        device=dev,
+        clip_weight=cw,
+        progress=False,
+    )
     s = hist(img)
-    print(f"  {name:9s} clip_w={cw:5.1f}:  shadows={s[0]:4.1f}%  highlights={s[1]:4.1f}%  "
-          f"midtones={s[2]:4.1f}%  std={s[3]:.2f}")
+    print(
+        f"  {name:9s} clip_w={cw:5.1f}:  shadows={s[0]:4.1f}%  highlights={s[1]:4.1f}%  "
+        f"midtones={s[2]:4.1f}%  std={s[3]:.2f}"
+    )
     p = f"outputs/tonal_{name}.png"
     save_image(img, p)
     entries.append((name, p))

@@ -47,12 +47,18 @@ class Critic(nn.Module):
         def blk(i, o):
             return nn.Sequential(nn.Conv2d(i, o, 3, 2, 1), nn.BatchNorm2d(o), nn.GELU())
 
-        self.body = nn.Sequential(blk(3, ch), blk(ch, ch * 2), blk(ch * 2, ch * 4),
-                                  blk(ch * 4, ch * 4), nn.AdaptiveAvgPool2d(1), nn.Flatten())
+        self.body = nn.Sequential(
+            blk(3, ch),
+            blk(ch, ch * 2),
+            blk(ch * 2, ch * 4),
+            blk(ch * 4, ch * 4),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
         self.head = nn.Linear(ch * 4, 1)
 
     def forward(self, x):
-        return self.head(self.body(x)).squeeze(-1)           # logit
+        return self.head(self.body(x)).squeeze(-1)  # logit
 
 
 class OrbitAugment:
@@ -75,20 +81,27 @@ class OrbitAugment:
     def __call__(self, img):
         H = img.shape[-1]
         if random.random() < 0.5:
-            img = torch.flip(img, [3])          # mirror
+            img = torch.flip(img, [3])  # mirror
         if random.random() < 0.5:
             img = torch.flip(img, [2])
-        mid = min(H, int(self.crop * 1.5))                    # rotation-safe intermediate (>= crop*sqrt2)
+        mid = min(H, int(self.crop * 1.5))  # rotation-safe intermediate (>= crop*sqrt2)
         off = max(0, min(self.translate, (H - mid) // 2))
-        cy = H // 2 + random.randint(-off, off)               # roaming-crop translation over the canvas
+        cy = H // 2 + random.randint(-off, off)  # roaming-crop translation over the canvas
         cx = H // 2 + random.randint(-off, off)
-        img = img[:, :, cy - mid // 2:cy - mid // 2 + mid, cx - mid // 2:cx - mid // 2 + mid]
-        if self.degrees:                                      # rotate the small patch (cheap CPU fallback)
-            img = TF.affine(img, angle=random.uniform(-self.degrees, self.degrees),
-                            translate=[0, 0], scale=1.0, shear=[0.0, 0.0],
-                            interpolation=TF.InterpolationMode.BILINEAR)
+        img = img[:, :, cy - mid // 2 : cy - mid // 2 + mid, cx - mid // 2 : cx - mid // 2 + mid]
+        if self.degrees:  # rotate the small patch (cheap CPU fallback)
+            img = TF.affine(
+                img,
+                angle=random.uniform(-self.degrees, self.degrees),
+                translate=[0, 0],
+                scale=1.0,
+                shear=[0.0, 0.0],
+                interpolation=TF.InterpolationMode.BILINEAR,
+            )
         o = (img.shape[-1] - self.crop) // 2
-        return img[:, :, o:o + self.crop, o:o + self.crop].contiguous()   # scale-exact 1:1 final crop
+        return img[
+            :, :, o : o + self.crop, o : o + self.crop
+        ].contiguous()  # scale-exact 1:1 final crop
 
 
 def render_blend(spectra, i, j, alpha, size, device):
@@ -109,7 +122,7 @@ def prep(img, crit_size, transforms=None):
 
 def sample_batch(spectra, pool, B, size, crit_size, transforms, device):
     ii = torch.randint(len(pool), (B,), device=pool.device)
-    jj = (ii + torch.randint(1, len(pool), (B,), device=pool.device)) % len(pool)   # j != i
+    jj = (ii + torch.randint(1, len(pool), (B,), device=pool.device)) % len(pool)  # j != i
     i, j = pool[ii], pool[jj]
     alpha = torch.rand(B, device=device)
     with torch.no_grad():
@@ -138,23 +151,31 @@ def main():
 
     dev = pick_device()
     blobs = [torch.load(c, weights_only=False) for c in args.corpus]
-    spectra = torch.cat([b["spectra"] for b in blobs], dim=0).to(dev)   # (N,3,H,Wf,2)
+    spectra = torch.cat([b["spectra"] for b in blobs], dim=0).to(dev)  # (N,3,H,Wf,2)
     size, N = blobs[0]["size"], spectra.shape[0]
     nval = max(8, N // 5)
     perm = torch.randperm(N)
     val_pool, train_pool = perm[:nval].to(dev), perm[nval:].to(dev)
-    transforms = OrbitAugment(crop=args.crit_size)   # isometries: teach the disc the facets' structure-preserving orbit is clean
+    transforms = OrbitAugment(
+        crop=args.crit_size
+    )  # isometries: teach the disc the facets' structure-preserving orbit is clean
     layers = "+".join(b.get("layer", "?") for b in blobs)
-    print(f"union [{layers}]  {N} stills @ {size}px  (train {len(train_pool)} / val {len(val_pool)})  "
-          f"crit {args.crit_size}px")
+    print(
+        f"union [{layers}]  {N} stills @ {size}px  (train {len(train_pool)} / val {len(val_pool)})  "
+        f"crit {args.crit_size}px"
+    )
 
     critic = Critic().to(dev)
     opt = torch.optim.Adam(critic.parameters(), lr=args.lr)
     critic.train()
     for _ in trange(args.steps, desc="train critic"):
-        x, target = sample_batch(spectra, train_pool, args.batch, size, args.crit_size, transforms, dev)
+        x, target = sample_batch(
+            spectra, train_pool, args.batch, size, args.crit_size, transforms, dev
+        )
         loss = F.mse_loss(torch.sigmoid(critic(x)), target)
-        opt.zero_grad(); loss.backward(); opt.step()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
     critic.eval()
     for p in critic.parameters():
         p.requires_grad_(False)
@@ -171,8 +192,9 @@ def main():
 
     def critic_score(img, draws=8):
         with torch.no_grad():
-            s = torch.stack([torch.sigmoid(critic(prep(img, args.crit_size, transforms)))
-                             for _ in range(draws)])
+            s = torch.stack(
+                [torch.sigmoid(critic(prep(img, args.crit_size, transforms))) for _ in range(draws)]
+            )
         return s.mean().item()
 
     # (b) de-smear the REAL mush: a spectrum-interpolated frame -- which is exactly
@@ -181,7 +203,7 @@ def main():
     # was the wrong object: it's coherent, and the critic rightly rates it clean. The
     # pipeline's mush is *interpolation*, and that is what we test here.)
     A, B = int(train_pool[0]), int(train_pool[1])
-    sA, sB = spectra[A:A + 1], spectra[B:B + 1]
+    sA, sB = spectra[A : A + 1], spectra[B : B + 1]
     ts = [0.0, 0.25, 0.5, 0.75, 1.0]
 
     def render_spec(spec):
@@ -197,7 +219,9 @@ def main():
         o = torch.optim.Adam([param.spectrum], lr=0.03)
         for _ in trange(steps, leave=False, desc=f"desmear lam={lam:g}"):
             o.zero_grad()
-            (lam * torch.sigmoid(critic(prep(param.to_image(), args.crit_size, transforms)))).backward()
+            (
+                lam * torch.sigmoid(critic(prep(param.to_image(), args.crit_size, transforms)))
+            ).backward()
             o.step()
         return param.to_image().detach()
 
@@ -209,7 +233,9 @@ def main():
         rows[0][1].append((raw, critic_score(raw)))
         rows[1][1].append((des, critic_score(des)))
     for label, cells in rows:
-        print(f"  {label:24s} " + "  ".join(f"t{ts[k]:.2f}:{cells[k][1]:.2f}" for k in range(len(ts))))
+        print(
+            f"  {label:24s} " + "  ".join(f"t{ts[k]:.2f}:{cells[k][1]:.2f}" for k in range(len(ts)))
+        )
 
     tw, band = 224, 22
     sheet = Image.new("RGB", (len(ts) * tw, len(rows) * (tw + band)), (12, 12, 12))

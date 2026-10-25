@@ -42,8 +42,9 @@ def render_one(spec, size, device):
     return fp.to_image().detach()
 
 
-def desmear_sequence(dense, critic, *, size, lam, anchor, steps, lr, warmstart, transforms, device,
-                     temporal=0.0):
+def desmear_sequence(
+    dense, critic, *, size, lam, anchor, steps, lr, warmstart, transforms, device, temporal=0.0
+):
     """Temporally-coherent critic projection over a sequence of (mushy) interp frames.
 
     Per frame, three forces: (lam) the critic de-fogs toward the clean manifold;
@@ -54,7 +55,7 @@ def desmear_sequence(dense, critic, *, size, lam, anchor, steps, lr, warmstart, 
     motion<->smoothness balance."""
     out, prev_spec, prev_img = [], None, None
     for k in range(dense.shape[0]):
-        interp = dense[k:k + 1].to(device)
+        interp = dense[k : k + 1].to(device)
         interp_img = render_one(interp, size, device)
         param = FourierImage(size, size, device=device)
         with torch.no_grad():
@@ -63,8 +64,10 @@ def desmear_sequence(dense, critic, *, size, lam, anchor, steps, lr, warmstart, 
         for _ in range(steps):
             opt.zero_grad()
             img = param.to_image()
-            loss = (lam * torch.sigmoid(critic(prep(img, CRIT_SIZE, transforms)))
-                    + anchor * ((img - interp_img) ** 2).mean())
+            loss = (
+                lam * torch.sigmoid(critic(prep(img, CRIT_SIZE, transforms)))
+                + anchor * ((img - interp_img) ** 2).mean()
+            )
             if temporal > 0 and prev_img is not None:
                 loss = loss + temporal * ((img - prev_img) ** 2).mean()
             loss.backward()
@@ -78,12 +81,15 @@ def desmear_sequence(dense, critic, *, size, lam, anchor, steps, lr, warmstart, 
 def _lowpass(img, k):
     """Crude low-pass: downsample by k then upsample back. k sets the band split."""
     h, w = img.shape[-2:]
-    small = F.interpolate(img, size=(max(1, h // k), max(1, w // k)), mode="bilinear", align_corners=False)
+    small = F.interpolate(
+        img, size=(max(1, h // k), max(1, w // k)), mode="bilinear", align_corners=False
+    )
     return F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
 
 
-def desmear_sequence_fb(dense, critic, *, size, lam, anchor_lo, temporal_hi, anchor_hi,
-                        k, steps, lr, transforms, device):
+def desmear_sequence_fb(
+    dense, critic, *, size, lam, anchor_lo, temporal_hi, anchor_hi, k, steps, lr, transforms, device
+):
     """Frequency-banded temporally-coherent projection.
 
     Low band -> the smooth interpolation (stable A->B trajectory, temporally smooth
@@ -93,7 +99,7 @@ def desmear_sequence_fb(dense, critic, *, size, lam, anchor_lo, temporal_hi, anc
     Critic de-fogs throughout. Warm-start from the previous frame's spectrum."""
     out, prev_spec, prev_hi = [], None, None
     for fi in range(dense.shape[0]):
-        interp = dense[fi:fi + 1].to(device)
+        interp = dense[fi : fi + 1].to(device)
         interp_img = render_one(interp, size, device)
         interp_lo = _lowpass(interp_img, k)
         interp_hi = interp_img - interp_lo
@@ -106,8 +112,10 @@ def desmear_sequence_fb(dense, critic, *, size, lam, anchor_lo, temporal_hi, anc
             img = param.to_image()
             lo = _lowpass(img, k)
             hi = img - lo
-            loss = (lam * torch.sigmoid(critic(prep(img, CRIT_SIZE, transforms)))
-                    + anchor_lo * ((lo - interp_lo) ** 2).mean())
+            loss = (
+                lam * torch.sigmoid(critic(prep(img, CRIT_SIZE, transforms)))
+                + anchor_lo * ((lo - interp_lo) ** 2).mean()
+            )
             if anchor_hi > 0:
                 loss = loss + anchor_hi * ((hi - interp_hi) ** 2).mean()
             if temporal_hi > 0 and prev_hi is not None:
@@ -125,7 +133,9 @@ def desmear_sequence_fb(dense, critic, *, size, lam, anchor_lo, temporal_hi, anc
 def jitter(imgs):
     arr = imgs.permute(0, 2, 3, 1).numpy()
     L = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
-    return float(np.abs(L[2:] - 2 * L[1:-1] + L[:-2]).mean() / (np.abs(L[1:] - L[:-1]).mean() + 1e-9))
+    return float(
+        np.abs(L[2:] - 2 * L[1:-1] + L[:-2]).mean() / (np.abs(L[1:] - L[:-1]).mean() + 1e-9)
+    )
 
 
 def to_pil(t):
@@ -138,7 +148,9 @@ def comparison_strip(base, des, n, path):
     tw, band = 224, 22
     sheet = Image.new("RGB", (n * tw, 2 * (tw + band)), (12, 12, 12))
     d = ImageDraw.Draw(sheet)
-    for r, (label, imgs) in enumerate([("baseline (raw densify)", base), ("+critic projection", des)]):
+    for r, (label, imgs) in enumerate(
+        [("baseline (raw densify)", base), ("+critic projection", des)]
+    ):
         top = r * (tw + band)
         d.text((6, top + 4), label, fill=(255, 255, 0))
         for c, i in enumerate(idxs):
@@ -185,30 +197,64 @@ def main():
     transforms = TransformRobustness(degrees=[])
 
     bb = Backbone("tiny", device=dev)
-    print(f"keyframes K={args.keyframes} @ {args.size}px  {args.layer} ch {args.from_ch}->{args.to_ch}"
-          f"  -> densify {args.frames}  -> critic projection (lam={args.lam} anchor={args.anchor})")
-    kf = optimize_keyframes(bb, args.layer, args.from_ch, args.to_ch, K=args.keyframes,
-                            height=args.size, width=args.size, steps=args.kf_steps,
-                            align_weight=args.align_weight, hf_smooth=args.hf_smooth,
-                            hf_cutoff=args.hf_cutoff, hf_width=args.hf_width, lr=args.lr,
-                            device=dev, segments=0, rotate=False)
+    print(
+        f"keyframes K={args.keyframes} @ {args.size}px  {args.layer} ch {args.from_ch}->{args.to_ch}"
+        f"  -> densify {args.frames}  -> critic projection (lam={args.lam} anchor={args.anchor})"
+    )
+    kf = optimize_keyframes(
+        bb,
+        args.layer,
+        args.from_ch,
+        args.to_ch,
+        K=args.keyframes,
+        height=args.size,
+        width=args.size,
+        steps=args.kf_steps,
+        align_weight=args.align_weight,
+        hf_smooth=args.hf_smooth,
+        hf_cutoff=args.hf_cutoff,
+        hf_width=args.hf_width,
+        lr=args.lr,
+        device=dev,
+        segments=0,
+        rotate=False,
+    )
     dense = catmull_rom(kf.cpu(), args.frames)
 
     base_imgs = render_spectra(dense, args.size, args.size, dev)
-    des_spec = desmear_sequence(dense, critic, size=args.size, lam=args.lam, anchor=args.anchor,
-                                steps=args.proj_steps, lr=args.proj_lr,
-                                warmstart=not args.no_warmstart, transforms=transforms, device=dev)
+    des_spec = desmear_sequence(
+        dense,
+        critic,
+        size=args.size,
+        lam=args.lam,
+        anchor=args.anchor,
+        steps=args.proj_steps,
+        lr=args.proj_lr,
+        warmstart=not args.no_warmstart,
+        transforms=transforms,
+        device=dev,
+    )
     des_imgs = render_spectra(des_spec, args.size, args.size, dev)
 
     def score(img):
         with torch.no_grad():
-            return torch.stack([torch.sigmoid(critic(prep(img[None].to(dev), CRIT_SIZE, transforms)))
-                                for _ in range(6)]).mean().item()
+            return (
+                torch.stack(
+                    [
+                        torch.sigmoid(critic(prep(img[None].to(dev), CRIT_SIZE, transforms)))
+                        for _ in range(6)
+                    ]
+                )
+                .mean()
+                .item()
+            )
 
     sample = [round(k * (args.frames - 1) / 5) for k in range(6)]
     sb = [score(base_imgs[i]) for i in sample]
     sd = [score(des_imgs[i]) for i in sample]
-    print(f"  jitter/motion   baseline={jitter(base_imgs):.3f}   +critic={jitter(des_imgs):.3f}   (lower=smoother)")
+    print(
+        f"  jitter/motion   baseline={jitter(base_imgs):.3f}   +critic={jitter(des_imgs):.3f}   (lower=smoother)"
+    )
     print("  critic-s base   " + "  ".join(f"{x:.2f}" for x in sb))
     print("  critic-s +crit  " + "  ".join(f"{x:.2f}" for x in sd))
 
@@ -216,7 +262,9 @@ def main():
     comparison_strip(base_imgs, des_imgs, 6, "outputs/morph_critic_strip.png")
     save_gif(base_imgs, "outputs/morph_base.gif", args.fps)
     save_gif(des_imgs, "outputs/morph_critic.gif", args.fps)
-    print("strip -> outputs/morph_critic_strip.png   gifs -> outputs/morph_base.gif, morph_critic.gif")
+    print(
+        "strip -> outputs/morph_critic_strip.png   gifs -> outputs/morph_base.gif, morph_critic.gif"
+    )
 
 
 if __name__ == "__main__":

@@ -54,8 +54,10 @@ def main():
 
     flicker_before = float(np.std(np.diff(L)))
     flicker_after = float(np.std(np.diff(Ls)))
-    print(f"frame-to-frame brightness jitter: {flicker_before:.3f} -> {flicker_after:.3f} "
-          f"({100 * (1 - flicker_after / flicker_before):.0f}% reduction)")
+    print(
+        f"frame-to-frame brightness jitter: {flicker_before:.3f} -> {flicker_after:.3f} "
+        f"({100 * (1 - flicker_after / flicker_before):.0f}% reduction)"
+    )
     print(f"stabilized frames -> {args.outdir}   gif -> {args.gif}")
 
 

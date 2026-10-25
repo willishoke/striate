@@ -24,11 +24,11 @@ from striate.util import pick_device, save_image
 
 def tokens_to_grid(tokens):
     B, N, D = tokens.shape
-    g = int(round(N ** 0.5))
-    if g * g != N:                 # strip any leading CLS/register tokens
-        tokens = tokens[:, N - g * g:, :]
+    g = int(round(N**0.5))
+    if g * g != N:  # strip any leading CLS/register tokens
+        tokens = tokens[:, N - g * g :, :]
         B, N, D = tokens.shape
-        g = int(round(N ** 0.5))
+        g = int(round(N**0.5))
     return tokens.reshape(B, g, g, D).permute(0, 3, 1, 2)  # (B, D, g, g)
 
 
@@ -51,7 +51,9 @@ def main():
     cfg = timm.data.resolve_model_data_config(model)
     mean = torch.tensor(cfg["mean"]).view(1, 3, 1, 1).to(dev)
     std = torch.tensor(cfg["std"]).view(1, 3, 1, 1).to(dev)
-    print(f"device {dev}  {args.model}  block {args.block}  norm {cfg['mean']}  input {cfg['input_size']}")
+    print(
+        f"device {dev}  {args.model}  block {args.block}  norm {cfg['mean']}  input {cfg['input_size']}"
+    )
 
     cap = {}
     handle = model.blocks[args.block].register_forward_hook(lambda m, i, o: cap.__setitem__("t", o))
