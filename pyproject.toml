@@ -1,6 +1,8 @@
 [project]
 name = "striate"
 version = "0.1.0"
+license = "MIT"
+license-files = ["LICENSE"]
 description = "Modern, hi-res feature visualization and temporal morphing -- a clean-room take on Distill 2017, pointed at a contemporary CNN."
 requires-python = ">=3.10"
 dependencies = [

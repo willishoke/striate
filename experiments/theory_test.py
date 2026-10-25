@@ -2,8 +2,10 @@
 clip and lambda=200 stay clean, while both stay smooth? 480p, 1s."""
 
 import os
+import sys
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # morph.py lives at the repo root
 
 import numpy as np
 
