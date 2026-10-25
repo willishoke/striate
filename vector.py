@@ -116,12 +116,13 @@ def main():
 
     prefix = args.out or f"outputs/vector_{args.layer.replace('.', '-')}_ch{args.channel}"
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
+    image.save(prefix + ".pt")
     with open(prefix + ".svg", "w") as f:
         f.write(image.to_svg(args.out_size, args.out_size))
     with torch.no_grad():
         # half-pixel edges at the output size: antialiased, not blurred
         save_image(image.render(args.out_size, args.out_size, 0.5), prefix + ".png")
-    print(f"saved: {prefix}.svg, {prefix}.png  ({time.time() - t0:.0f}s)")
+    print(f"saved: {prefix}.svg, .png, .pt  ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":

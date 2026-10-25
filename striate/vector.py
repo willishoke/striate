@@ -50,6 +50,15 @@ class VectorImage(torch.nn.Module):
         self.fill = fill
         self.learn_alpha = learn_alpha
         self.decorrelate = decorrelate
+        # enough to rebuild the module around a saved state_dict (see ``load``)
+        self.config = dict(
+            shapes=shapes,
+            harmonics=harmonics,
+            decay=decay,
+            fill=fill,
+            learn_alpha=learn_alpha,
+            decorrelate=decorrelate,
+        )
         k = shapes
 
         lo, hi = math.log(radius_range[0]), math.log(radius_range[1])
@@ -68,6 +77,17 @@ class VectorImage(torch.nn.Module):
         self.register_buffer("harm_scale", _HARMONIC_SCALE / orders**decay)
         self.register_buffer("orders", orders)
         self.to(device)
+
+    def save(self, path: str) -> str:
+        torch.save({"config": self.config, "state": self.state_dict()}, path)
+        return path
+
+    @classmethod
+    def load(cls, path: str, device: str = "cpu") -> "VectorImage":
+        saved = torch.load(path, map_location=device)
+        image = cls(**saved["config"], device=device)
+        image.load_state_dict(saved["state"])
+        return image
 
     # --- geometry, in image units -------------------------------------------------
 
