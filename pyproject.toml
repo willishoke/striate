@@ -32,5 +32,7 @@ line-length = 100
 [tool.ruff.lint]
 # experiments/ is research code: formatted, but not held to lint
 exclude = ["experiments/**"]
-# dict(BASE, key=val) reads better than {**BASE, "key": val} in config tables
-ignore = ["C408"]
+
+[tool.ruff.lint.flake8-comprehensions]
+# allow dict(key=val) (the style of strobe_bench's config tables); bare dict()/list() still flagged
+allow-dict-calls-with-keyword-arguments = true
