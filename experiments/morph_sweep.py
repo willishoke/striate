@@ -34,9 +34,9 @@ def jitter_motion(imgs):
 
 CONFIGS = [
     dict(name="continuation", lam=3, anchor=25, temporal=0, steps=20),
-    dict(name="balanced",     lam=3, anchor=20, temporal=60, steps=30),
-    dict(name="strong-temp",  lam=2, anchor=18, temporal=140, steps=40),
-    dict(name="gentle-warm",  lam=2, anchor=22, temporal=0, steps=12),
+    dict(name="balanced", lam=3, anchor=20, temporal=60, steps=30),
+    dict(name="strong-temp", lam=2, anchor=18, temporal=140, steps=40),
+    dict(name="gentle-warm", lam=2, anchor=22, temporal=0, steps=12),
 ]
 
 
@@ -60,10 +60,18 @@ def main():
     transforms = TransformRobustness(degrees=[])
     bb = Backbone("tiny", device=dev)
     idx = int(args.layer.split(".")[1])
-    sub = bb.model.features[:idx + 1]
+    sub = bb.model.features[: idx + 1]
 
-    ep = render_group(bb, sub, [args.from_ch, args.to_ch], size=args.size, steps=160,
-                      lr=0.05, transforms=transforms, device=dev).to(dev)
+    ep = render_group(
+        bb,
+        sub,
+        [args.from_ch, args.to_ch],
+        size=args.size,
+        steps=160,
+        lr=0.05,
+        transforms=transforms,
+        device=dev,
+    ).to(dev)
     sA, sB = ep[0:1], ep[1:2]
     ts = torch.linspace(0, 1, args.frames)
     dense = torch.cat([((1 - t) * sA + t * sB).cpu() for t in ts], dim=0)
@@ -72,18 +80,33 @@ def main():
     def mid_critic(imgs):
         mid = range(args.frames // 4, 3 * args.frames // 4)
         with torch.no_grad():
-            s = [torch.sigmoid(critic(prep(imgs[i][None].to(dev), CRIT_SIZE, transforms))).item() for i in mid]
+            s = [
+                torch.sigmoid(critic(prep(imgs[i][None].to(dev), CRIT_SIZE, transforms))).item()
+                for i in mid
+            ]
         return float(np.mean(s))
 
     bj, bd = jitter_motion(base_imgs)
-    print(f"baseline (raw interp):  jitter={bj:.3f}  motion={bd:.4f}  mid-critic={mid_critic(base_imgs):.2f}")
+    print(
+        f"baseline (raw interp):  jitter={bj:.3f}  motion={bd:.4f}  mid-critic={mid_critic(base_imgs):.2f}"
+    )
     print(f"{'config':14s} {'jitter':>8s} {'motion':>8s} {'mid-crit':>9s}")
 
     results = []
     for cfg in CONFIGS:
-        des_spec = desmear_sequence(dense, critic, size=args.size, lam=cfg["lam"], anchor=cfg["anchor"],
-                                    temporal=cfg["temporal"], steps=cfg["steps"], lr=args.proj_lr,
-                                    warmstart=True, transforms=transforms, device=dev)
+        des_spec = desmear_sequence(
+            dense,
+            critic,
+            size=args.size,
+            lam=cfg["lam"],
+            anchor=cfg["anchor"],
+            temporal=cfg["temporal"],
+            steps=cfg["steps"],
+            lr=args.proj_lr,
+            warmstart=True,
+            transforms=transforms,
+            device=dev,
+        )
         des = render_spectra(des_spec, args.size, args.size, dev)
         j, d = jitter_motion(des)
         mc = mid_critic(des)
@@ -94,11 +117,15 @@ def main():
     ok = [r for r in results if r[3] >= 0.4 * bd and r[4] < 0.3]
     pick = min(ok, key=lambda r: r[2]) if ok else min(results, key=lambda r: r[2])
     cfg, des = pick[0], pick[1]
-    print(f"chosen: {cfg['name']}  (jitter={pick[2]:.3f} motion={pick[3]:.4f} mid-crit={pick[4]:.2f})")
+    print(
+        f"chosen: {cfg['name']}  (jitter={pick[2]:.3f} motion={pick[3]:.4f} mid-crit={pick[4]:.2f})"
+    )
     comparison_strip(base_imgs, des, 6, "outputs/morph_sweep_strip.png")
     save_gif(base_imgs, "outputs/morph_sweep_base.gif", 20)
     save_gif(des, "outputs/morph_sweep_best.gif", 20)
-    print("strip -> outputs/morph_sweep_strip.png   gifs -> morph_sweep_base.gif, morph_sweep_best.gif")
+    print(
+        "strip -> outputs/morph_sweep_strip.png   gifs -> morph_sweep_base.gif, morph_sweep_best.gif"
+    )
 
 
 if __name__ == "__main__":

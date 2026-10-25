@@ -39,13 +39,23 @@ def main():
     dev = pick_device()
     transforms = TransformRobustness(degrees=[])
     bb = Backbone("tiny", device=dev)
-    sub = bb.model.features[:int(args.layer.split(".")[1]) + 1]
-    print(f"naive {args.size}px  {args.layer}:{args.from_ch} -> {args.to_ch}  "
-          f"frames={args.frames}  (critic-free interpolation)")
+    sub = bb.model.features[: int(args.layer.split(".")[1]) + 1]
+    print(
+        f"naive {args.size}px  {args.layer}:{args.from_ch} -> {args.to_ch}  "
+        f"frames={args.frames}  (critic-free interpolation)"
+    )
 
     t0 = time.perf_counter()
-    ep = render_group(bb, sub, [args.from_ch, args.to_ch], size=args.size, steps=args.endpoint_steps,
-                      lr=args.lr, transforms=transforms, device=dev).to(dev)
+    ep = render_group(
+        bb,
+        sub,
+        [args.from_ch, args.to_ch],
+        size=args.size,
+        steps=args.endpoint_steps,
+        lr=args.lr,
+        transforms=transforms,
+        device=dev,
+    ).to(dev)
     print(f"  endpoints: {time.perf_counter() - t0:.1f}s")
 
     sA, sB = ep[0:1], ep[1:2]

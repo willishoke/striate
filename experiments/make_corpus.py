@@ -34,8 +34,8 @@ def render_group(bb, sub, channels, *, size, steps, lr, transforms, device):
     for _ in trange(steps, leave=False, desc=f"ch {channels[0]}..{channels[-1]}"):
         opt.zero_grad()
         img = param.to_image()
-        act = sub(bb.normalize(transforms(img)))             # (B, C, h, w)
-        sel = act[torch.arange(B, device=device), chs]       # (B, h, w): each elem its own channel
+        act = sub(bb.normalize(transforms(img)))  # (B, C, h, w)
+        sel = act[torch.arange(B, device=device), chs]  # (B, h, w): each elem its own channel
         (-sel.mean()).backward()
         opt.step()
     return param.spectrum.detach().cpu()
@@ -56,22 +56,33 @@ def main():
     dev = pick_device()
     bb = Backbone("tiny", device=dev)
     idx = int(args.layer.split(".")[1])
-    sub = bb.model.features[:idx + 1]
-    transforms = TransformRobustness(degrees=[])             # no rotation (CPU fallback)
+    sub = bb.model.features[: idx + 1]
+    transforms = TransformRobustness(degrees=[])  # no rotation (CPU fallback)
     channels = list(range(0, args.n * args.stride, args.stride))
     print(f"corpus: {len(channels)} stills  {args.layer}  @ {args.size}px  groups of {args.group}")
 
     spectra = []
     for s in range(0, len(channels), args.group):
-        grp = channels[s:s + args.group]
-        spectra.append(render_group(bb, sub, grp, size=args.size, steps=args.steps,
-                                     lr=args.lr, transforms=transforms, device=dev))
+        grp = channels[s : s + args.group]
+        spectra.append(
+            render_group(
+                bb,
+                sub,
+                grp,
+                size=args.size,
+                steps=args.steps,
+                lr=args.lr,
+                transforms=transforms,
+                device=dev,
+            )
+        )
         print(f"  rendered {s + len(grp)}/{len(channels)}")
-    spectra = torch.cat(spectra, dim=0)                      # (N, 3, H, Wf, 2)
+    spectra = torch.cat(spectra, dim=0)  # (N, 3, H, Wf, 2)
 
     os.makedirs("outputs", exist_ok=True)
-    torch.save({"spectra": spectra, "channels": channels, "size": args.size,
-                "layer": args.layer}, args.out)
+    torch.save(
+        {"spectra": spectra, "channels": channels, "size": args.size, "layer": args.layer}, args.out
+    )
     print(f"saved spectra {tuple(spectra.shape)} -> {args.out}")
 
     cols, tw = 8, 128

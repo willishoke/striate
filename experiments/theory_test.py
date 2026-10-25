@@ -5,7 +5,9 @@ import os
 import sys
 
 os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))  # morph.py lives at the repo root
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+)  # morph.py lives at the repo root
 
 import numpy as np
 
@@ -34,10 +36,25 @@ tsched = pacing_schedule(vel, FR)
 print(f"theory test {LAYER} ch{A}->ch{B} @ {W}x{H}, {FR} frames:")
 for name, lam in [("lambda200", 200.0), ("lambda800", 800.0)]:
     outdir = f"outputs/theory_{name}"
-    imgs = run_morph(bb, LAYER, A, B, tsched, width=W, height=H, steps_per_frame=8,
-                     warmup=80, lr=0.05, device=dev, coherence_loss=lam,
-                     collect=True, outdir=outdir)
+    imgs = run_morph(
+        bb,
+        LAYER,
+        A,
+        B,
+        tsched,
+        width=W,
+        height=H,
+        steps_per_frame=8,
+        warmup=80,
+        lr=0.05,
+        device=dev,
+        coherence_loss=lam,
+        collect=True,
+        outdir=outdir,
+    )
     r = metrics(imgs)
-    print(f"  {name}: jitter/motion={r[0]:.2f}  shadows={r[1]:.1f}%  highlights={r[2]:.1f}%  midtones={r[3]:.1f}%")
+    print(
+        f"  {name}: jitter/motion={r[0]:.2f}  shadows={r[1]:.1f}%  highlights={r[2]:.1f}%  midtones={r[3]:.1f}%"
+    )
     strip(outdir, FR, f"outputs/theory_{name}_strip.png")
 print("done")

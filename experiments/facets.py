@@ -39,11 +39,13 @@ def render_facets(bb, sub, channel, count, *, size, steps, lr, div, transforms, 
     for _ in trange(steps, leave=False, desc=f"x{count}"):
         opt.zero_grad()
         act = sub(bb.normalize(transforms(param.to_image())))
-        drive = act[:, channel].mean()                            # all facets fire the channel
+        drive = act[:, channel].mean()  # all facets fire the channel
         if count > 1 and div > 0:
             g = gram_vecs(act)
             sim = g @ g.t()
-            diversity = (sim - torch.eye(count, device=device)).clamp(min=0).sum() / (count * (count - 1))
+            diversity = (sim - torch.eye(count, device=device)).clamp(min=0).sum() / (
+                count * (count - 1)
+            )
         else:
             diversity = 0.0
         (-drive + div * diversity).backward()
@@ -66,18 +68,37 @@ def main():
 
     dev = pick_device()
     bb = Backbone("tiny", device=dev)
-    sub = bb.model.features[:int(args.layer.split(".")[1]) + 1]
+    sub = bb.model.features[: int(args.layer.split(".")[1]) + 1]
     transforms = TransformRobustness(degrees=[])
 
     spectra = []
     for s in range(0, args.n, args.group):
         cnt = min(args.group, args.n - s)
-        spectra.append(render_facets(bb, sub, args.channel, cnt, size=args.size, steps=args.steps,
-                                     lr=args.lr, div=args.div, transforms=transforms, device=dev))
+        spectra.append(
+            render_facets(
+                bb,
+                sub,
+                args.channel,
+                cnt,
+                size=args.size,
+                steps=args.steps,
+                lr=args.lr,
+                div=args.div,
+                transforms=transforms,
+                device=dev,
+            )
+        )
         print(f"  group {s // args.group + 1}: {cnt} facets")
     spectra = torch.cat(spectra, dim=0)
-    torch.save({"spectra": spectra, "channels": [args.channel] * args.n,
-                "size": args.size, "layer": args.layer}, args.out)
+    torch.save(
+        {
+            "spectra": spectra,
+            "channels": [args.channel] * args.n,
+            "size": args.size,
+            "layer": args.layer,
+        },
+        args.out,
+    )
 
     fp = FourierImage(args.size, args.size, batch=args.n, device=dev)
     with torch.no_grad():

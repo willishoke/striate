@@ -27,7 +27,9 @@ def _build_objective(args):
 
 
 def main():
-    p = argparse.ArgumentParser(description="Modern hi-res feature visualization (Distill 2017 method).")
+    p = argparse.ArgumentParser(
+        description="Modern hi-res feature visualization (Distill 2017 method)."
+    )
     p.add_argument("--model", default="tiny", choices=["tiny", "small", "base"])
     p.add_argument("--layer", default="features.5", help="module path, e.g. features.5")
     p.add_argument("--channel", type=int, default=0)
@@ -38,8 +40,12 @@ def main():
     p.add_argument("--no-decorrelate", action="store_true")
     p.add_argument("--progressive", action="store_true", help="octave render toward hi-res")
     p.add_argument("--sizes", default="256,384,512,768")
-    p.add_argument("--width", type=int, default=None, help="target width for a 16:9 progressive render")
-    p.add_argument("--height", type=int, default=None, help="target height for a 16:9 progressive render")
+    p.add_argument(
+        "--width", type=int, default=None, help="target width for a 16:9 progressive render"
+    )
+    p.add_argument(
+        "--height", type=int, default=None, help="target height for a 16:9 progressive render"
+    )
     p.add_argument("--out", default=None)
     p.add_argument("--list-layers", action="store_true")
     args = p.parse_args()
@@ -65,13 +71,25 @@ def main():
         else:
             sizes = tuple(int(s) for s in args.sizes.split(","))
         image = render_progressive(
-            backbone, objective, layers, sizes=sizes, steps=args.steps,
-            lr=args.lr, decorrelate=decorrelate, device=device,
+            backbone,
+            objective,
+            layers,
+            sizes=sizes,
+            steps=args.steps,
+            lr=args.lr,
+            decorrelate=decorrelate,
+            device=device,
         )
     else:
         image = render(
-            backbone, objective, layers, size=args.size, steps=args.steps,
-            lr=args.lr, decorrelate=decorrelate, device=device,
+            backbone,
+            objective,
+            layers,
+            size=args.size,
+            steps=args.steps,
+            lr=args.lr,
+            decorrelate=decorrelate,
+            device=device,
         )
 
     out = args.out or f"outputs/{args.model}_{args.layer.replace('.', '-')}_ch{args.channel}.png"

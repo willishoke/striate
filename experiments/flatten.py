@@ -33,7 +33,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--indir", default="outputs/clean_frames")
     ap.add_argument("--outdir", default="outputs/flat_frames")
-    ap.add_argument("--radius", type=float, default=100.0, help="blur radius (px); larger = removes only the biggest-scale field")
+    ap.add_argument(
+        "--radius",
+        type=float,
+        default=100.0,
+        help="blur radius (px); larger = removes only the biggest-scale field",
+    )
     ap.add_argument("--strip", default="outputs/flat_strip.png")
     args = ap.parse_args()
 
@@ -45,10 +50,14 @@ def main():
         blur = np.asarray(im.filter(ImageFilter.GaussianBlur(args.radius))).astype(np.float64)
         # subtract large-scale field, add back its global mean per channel
         out = a - blur + blur.reshape(-1, 3).mean(0)
-        Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(f"{args.outdir}/frame_{i:04d}.png")
+        Image.fromarray(np.clip(out, 0, 255).astype(np.uint8)).save(
+            f"{args.outdir}/frame_{i:04d}.png"
+        )
 
     strip(args.outdir, len(frames), args.strip)
-    print(f"flattened {len(frames)} frames (radius={args.radius}) -> {args.outdir}  strip -> {args.strip}")
+    print(
+        f"flattened {len(frames)} frames (radius={args.radius}) -> {args.outdir}  strip -> {args.strip}"
+    )
 
 
 if __name__ == "__main__":

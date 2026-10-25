@@ -35,28 +35,27 @@ from striate.transforms import TransformRobustness
 from striate.util import pick_device, save_image
 
 
-def optimize_frame(bb, sub, ch_a, ch_b, *, t, commit_weight, size,
-                   steps, lr, transforms, device):
+def optimize_frame(bb, sub, ch_a, ch_b, *, t, commit_weight, size, steps, lr, transforms, device):
     param = FourierImage(size, size, device=device)
     opt = torch.optim.Adam([param.spectrum], lr=lr)
     for _ in trange(steps, leave=False, desc=f"t={t:.2f} c={commit_weight:g}"):
         opt.zero_grad()
         img = param.to_image()
-        act = sub(bb.normalize(transforms(img)))            # (1, C, H, W)
-        v = act.mean(dim=(2, 3))[0]                          # signed channel means
-        drive = (1 - t) * v[ch_a] + t * v[ch_b]             # existing blended objective
+        act = sub(bb.normalize(transforms(img)))  # (1, C, H, W)
+        v = act.mean(dim=(2, 3))[0]  # signed channel means
+        drive = (1 - t) * v[ch_a] + t * v[ch_b]  # existing blended objective
         loss = -drive
         if commit_weight > 0:
-            e = (act ** 2).mean(dim=(2, 3))[0]              # per-channel energy (>=0)
+            e = (act**2).mean(dim=(2, 3))[0]  # per-channel energy (>=0)
             concentration = (e[ch_a] + e[ch_b]) / (e.sum() + 1e-6)
-            loss = loss - commit_weight * concentration      # reward commitment
+            loss = loss - commit_weight * concentration  # reward commitment
         loss.backward()
         opt.step()
     with torch.no_grad():
         img = param.to_image()
         act = sub(bb.normalize(img))
         v = act.mean(dim=(2, 3))[0]
-        e = (act ** 2).mean(dim=(2, 3))[0]
+        e = (act**2).mean(dim=(2, 3))[0]
         drive = ((1 - t) * v[ch_a] + t * v[ch_b]).item()
         conc = ((e[ch_a] + e[ch_b]) / (e.sum() + 1e-6)).item()
     return img.detach(), drive, conc
@@ -72,19 +71,24 @@ def main():
     ap.add_argument("--size", type=int, default=448)
     ap.add_argument("--steps", type=int, default=140)
     ap.add_argument("--lr", type=float, default=0.05)
-    ap.add_argument("--no-rotate", action="store_true",
-                    help="drop rotation (the lone CPU-fallback grid_sample on MPS) for speed")
+    ap.add_argument(
+        "--no-rotate",
+        action="store_true",
+        help="drop rotation (the lone CPU-fallback grid_sample on MPS) for speed",
+    )
     ap.add_argument("--out", default="outputs/commit_sheet.png")
     args = ap.parse_args()
 
     dev = pick_device()
     bb = Backbone("tiny", device=dev)
     idx = int(args.layer.split(".")[1])
-    sub = bb.model.features[:idx + 1]
+    sub = bb.model.features[: idx + 1]
     transforms = TransformRobustness(degrees=[] if args.no_rotate else None)
     ts = [i / (args.tpoints - 1) for i in range(args.tpoints)]
-    print(f"commit POC  {args.layer}  ch {args.from_ch}->{args.to_ch}  @ {args.size}px  "
-          f"commit_weight={args.commit_weight}  steps={args.steps}  rotate={not args.no_rotate}")
+    print(
+        f"commit POC  {args.layer}  ch {args.from_ch}->{args.to_ch}  @ {args.size}px  "
+        f"commit_weight={args.commit_weight}  steps={args.steps}  rotate={not args.no_rotate}"
+    )
 
     os.makedirs("outputs/commit", exist_ok=True)
     rows = []  # (label, [(path, drive, conc), ...])
@@ -93,9 +97,18 @@ def main():
         frames = []
         for t in ts:
             img, drive, conc = optimize_frame(
-                bb, sub, args.from_ch, args.to_ch, t=t, commit_weight=cw,
-                size=args.size, steps=args.steps, lr=args.lr,
-                transforms=transforms, device=dev)
+                bb,
+                sub,
+                args.from_ch,
+                args.to_ch,
+                t=t,
+                commit_weight=cw,
+                size=args.size,
+                steps=args.steps,
+                lr=args.lr,
+                transforms=transforms,
+                device=dev,
+            )
             p = f"outputs/commit/{tag}_t{t:.2f}.png"
             save_image(img, p)
             frames.append((p, drive, conc))

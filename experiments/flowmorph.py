@@ -29,7 +29,7 @@ def base_grid(H, W, device):
     ys = torch.linspace(-1, 1, H, device=device)
     xs = torch.linspace(-1, 1, W, device=device)
     gy, gx = torch.meshgrid(ys, xs, indexing="ij")
-    return torch.stack([gx, gy], dim=-1)[None]                       # (1,H,W,2)
+    return torch.stack([gx, gy], dim=-1)[None]  # (1,H,W,2)
 
 
 def optimize_flow(A, B, base, *, ctrl, steps, lr, smooth):
@@ -42,8 +42,11 @@ def optimize_flow(A, B, base, *, ctrl, steps, lr, smooth):
         wA = F.grid_sample(A, base + f, align_corners=True, padding_mode="reflection")
         loss = ((wA - B) ** 2).mean()
         if smooth > 0:
-            loss = loss + smooth * ((flow[:, :, 1:] - flow[:, :, :-1]) ** 2).mean() \
-                        + smooth * ((flow[:, :, :, 1:] - flow[:, :, :, :-1]) ** 2).mean()
+            loss = (
+                loss
+                + smooth * ((flow[:, :, 1:] - flow[:, :, :-1]) ** 2).mean()
+                + smooth * ((flow[:, :, :, 1:] - flow[:, :, :, :-1]) ** 2).mean()
+            )
         loss.backward()
         opt.step()
     return flow.detach()
@@ -52,9 +55,13 @@ def optimize_flow(A, B, base, *, ctrl, steps, lr, smooth):
 def morph_frame(A, B, flow, t, base):
     H, W = A.shape[-2:]
     f = F.interpolate(flow, (H, W), mode="bilinear", align_corners=True).permute(0, 2, 3, 1)
-    wA = F.grid_sample(A, base + t * f, align_corners=True, padding_mode="reflection")       # A -> midpoint
-    wB = F.grid_sample(B, base - (1 - t) * f, align_corners=True, padding_mode="reflection")  # B -> midpoint
-    return (1 - t) * wA + t * wB                                     # blend ALIGNED features = sharp
+    wA = F.grid_sample(
+        A, base + t * f, align_corners=True, padding_mode="reflection"
+    )  # A -> midpoint
+    wB = F.grid_sample(
+        B, base - (1 - t) * f, align_corners=True, padding_mode="reflection"
+    )  # B -> midpoint
+    return (1 - t) * wA + t * wB  # blend ALIGNED features = sharp
 
 
 def main():
@@ -62,7 +69,9 @@ def main():
     ap.add_argument("--facets", default="outputs/facets_l3_84.pt")
     ap.add_argument("--waypoints", type=int, default=12)
     ap.add_argument("--per-seg", type=int, default=8)
-    ap.add_argument("--ctrl", type=int, default=48, help="flow control-grid resolution (smoothness)")
+    ap.add_argument(
+        "--ctrl", type=int, default=48, help="flow control-grid resolution (smoothness)"
+    )
     ap.add_argument("--steps", type=int, default=150)
     ap.add_argument("--lr", type=float, default=0.05)
     ap.add_argument("--smooth", type=float, default=0.5)
@@ -82,15 +91,17 @@ def main():
     sel = tight_neighborhood(squint, min(args.waypoints, N))
     tour = nn_tour(squint[sel])
     wp = [sel[t] for t in tour]
-    wp = wp + [wp[0]]                                                # loop closure
+    wp = wp + [wp[0]]  # loop closure
     print(f"flow-morph {len(wp) - 1} segments x {args.per_seg} @ {size}px  ctrl {args.ctrl}")
 
     base = base_grid(size, size, dev)
     frames = []
     mid_first = None
     for s in range(len(wp) - 1):
-        A, B = imgs[wp[s]:wp[s] + 1], imgs[wp[s + 1]:wp[s + 1] + 1]
-        flow = optimize_flow(A, B, base, ctrl=args.ctrl, steps=args.steps, lr=args.lr, smooth=args.smooth)
+        A, B = imgs[wp[s] : wp[s] + 1], imgs[wp[s + 1] : wp[s + 1] + 1]
+        flow = optimize_flow(
+            A, B, base, ctrl=args.ctrl, steps=args.steps, lr=args.lr, smooth=args.smooth
+        )
         for k in range(args.per_seg):
             t = k / args.per_seg
             fr = morph_frame(A, B, flow, t, base).detach()
@@ -105,7 +116,9 @@ def main():
         to_pil(seq[i]).save(f"{fdir}/f{i:04d}.png")
     to_pil(mid_first[0]).save(f"outputs/{args.tag}_midcheck.png")
     save_gif(seq, f"outputs/{args.tag}.gif", 20)
-    print(f"{seq.shape[0]} frames  jitter={jitter(seq):.3f}  -> {fdir}/, {args.tag}.gif, {args.tag}_midcheck.png")
+    print(
+        f"{seq.shape[0]} frames  jitter={jitter(seq):.3f}  -> {fdir}/, {args.tag}.gif, {args.tag}_midcheck.png"
+    )
 
 
 if __name__ == "__main__":

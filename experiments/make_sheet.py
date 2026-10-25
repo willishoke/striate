@@ -44,7 +44,9 @@ def main():
         d.rectangle([x + 3, y + 3, x + 46, y + 20], fill=(0, 0, 0))
         d.text((x + 6, y + 5), f"{ch}", fill=(255, 255, 0))
     sheet.save(args.out)
-    print(f"{len(channels)} {layer} endpoints -> {args.out} ({cols}x{rows} @ {T}px, channel# labeled)")
+    print(
+        f"{len(channels)} {layer} endpoints -> {args.out} ({cols}x{rows} @ {T}px, channel# labeled)"
+    )
 
 
 if __name__ == "__main__":

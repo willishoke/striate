@@ -83,9 +83,7 @@ class FourierImage(torch.nn.Module):
         spectrum = self.spectrum if spectrum is None else spectrum
         scaled = spectrum * self.spectrum_scale
         complex_spectrum = torch.view_as_complex(scaled.contiguous())
-        image = torch.fft.irfftn(
-            complex_spectrum, s=(self.height, self.width), dim=(2, 3)
-        )
+        image = torch.fft.irfftn(complex_spectrum, s=(self.height, self.width), dim=(2, 3))
         image = image / 4.0  # empirical scaling so the std lands in a usable range
         if self.decorrelate:
             image = self._decorrelate_color(image)

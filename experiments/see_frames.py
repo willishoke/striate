@@ -26,17 +26,30 @@ bb = Backbone("tiny", device=dev)
 sub = bb.model.features[:6]
 SIZE, FRAMES = 320, 20
 
-ep = render_group(bb, sub, [42, 90], size=SIZE, steps=160, lr=0.05, transforms=transforms, device=dev).to(dev)
+ep = render_group(
+    bb, sub, [42, 90], size=SIZE, steps=160, lr=0.05, transforms=transforms, device=dev
+).to(dev)
 sA, sB = ep[0:1], ep[1:2]
 ts = torch.linspace(0, 1, FRAMES)
 dense = torch.cat([((1 - t) * sA + t * sB).cpu() for t in ts], dim=0)
 
-des_spec = desmear_sequence(dense, critic, size=SIZE, lam=2, anchor=18, temporal=140,
-                            steps=40, lr=0.03, warmstart=True, transforms=transforms, device=dev)
+des_spec = desmear_sequence(
+    dense,
+    critic,
+    size=SIZE,
+    lam=2,
+    anchor=18,
+    temporal=140,
+    steps=40,
+    lr=0.03,
+    warmstart=True,
+    transforms=transforms,
+    device=dev,
+)
 des = render_spectra(des_spec, SIZE, SIZE, dev)
 base = render_spectra(dense, SIZE, SIZE, dev)
 
-idxs = [9, 10, 11, 12]                       # consecutive transition frames
+idxs = [9, 10, 11, 12]  # consecutive transition frames
 for name, imgs in [("des", des), ("base", base)]:
     sheet = Image.new("RGB", (2 * SIZE, 2 * SIZE), (12, 12, 12))
     for n, i in enumerate(idxs):

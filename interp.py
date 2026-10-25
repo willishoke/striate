@@ -26,8 +26,22 @@ from striate.transforms import TransformRobustness
 from striate.util import pick_device, save_image
 
 
-def run_interp(bb, layer, ch_a, ch_b, *, N, size, steps, align_weight, lr,
-               hf_smooth, hf_cutoff, hf_width, device):
+def run_interp(
+    bb,
+    layer,
+    ch_a,
+    ch_b,
+    *,
+    N,
+    size,
+    steps,
+    align_weight,
+    lr,
+    hf_smooth,
+    hf_cutoff,
+    hf_width,
+    device,
+):
     bb.clear_hooks()
     bb.hook(layer)
     param = FourierImage(size, size, batch=N, device=device)
@@ -52,8 +66,8 @@ def run_interp(bb, layer, ch_a, ch_b, *, N, size, steps, align_weight, lr,
         loss = -((1 - t) * a + t * b).mean()
         loss = loss + align_weight * ((images[1:] - images[:-1]) ** 2).mean()
         if hf_smooth > 0.0:
-            dspec = param.spectrum[1:] - param.spectrum[:-1]      # adjacent-frame spectrum change
-            loss = loss + hf_smooth * (hp_mask * dspec ** 2).mean()  # penalize HIGH-freq change only
+            dspec = param.spectrum[1:] - param.spectrum[:-1]  # adjacent-frame spectrum change
+            loss = loss + hf_smooth * (hp_mask * dspec**2).mean()  # penalize HIGH-freq change only
         loss.backward()
         opt.step()
 
@@ -73,11 +87,16 @@ def export(images, tag, fps):
     d = f"outputs/interp_{tag}"
     os.makedirs(d, exist_ok=True)
     for i in range(N):
-        save_image(images[i:i + 1], f"{d}/frame_{i:04d}.png")
+        save_image(images[i : i + 1], f"{d}/frame_{i:04d}.png")
     pil = [Image.open(f"{d}/frame_{i:04d}.png") for i in range(N)]
     loop = pil + pil[-2:0:-1]
-    loop[0].save(f"outputs/interp_{tag}.gif", save_all=True, append_images=loop[1:],
-                 duration=1000 // fps, loop=0)
+    loop[0].save(
+        f"outputs/interp_{tag}.gif",
+        save_all=True,
+        append_images=loop[1:],
+        duration=1000 // fps,
+        loop=0,
+    )
 
 
 def main():
@@ -98,12 +117,25 @@ def main():
 
     dev = pick_device()
     bb = Backbone("tiny", device=dev)
-    print(f"sweep {args.layer} ch{args.from_ch}->ch{args.to_ch}  N={args.frames} @ {args.size}px, hf-smooth sweep:")
+    print(
+        f"sweep {args.layer} ch{args.from_ch}->ch{args.to_ch}  N={args.frames} @ {args.size}px, hf-smooth sweep:"
+    )
     for hs in [float(x) for x in args.hf_smooth.split(",")]:
-        imgs = run_interp(bb, args.layer, args.from_ch, args.to_ch, N=args.frames,
-                          size=args.size, steps=args.steps, align_weight=args.align_weight,
-                          lr=args.lr, hf_smooth=hs, hf_cutoff=args.hf_cutoff,
-                          hf_width=args.hf_width, device=dev)
+        imgs = run_interp(
+            bb,
+            args.layer,
+            args.from_ch,
+            args.to_ch,
+            N=args.frames,
+            size=args.size,
+            steps=args.steps,
+            align_weight=args.align_weight,
+            lr=args.lr,
+            hf_smooth=hs,
+            hf_cutoff=args.hf_cutoff,
+            hf_width=args.hf_width,
+            device=dev,
+        )
         tag = f"hf{hs:g}"
         export(imgs, tag, args.fps)
         print(f"  hf_smooth={hs:7g}: jitter/motion={metric(imgs):.2f}  -> outputs/interp_{tag}.gif")

@@ -41,7 +41,7 @@ BANDS = [("0-4px", 0.5, 2), ("4-16px", 2, 8), ("16-64px", 8, 32)]
 
 def blur(x, s):
     k = int(3 * s) * 2 + 1
-    g = torch.exp(-(torch.arange(k, device=x.device) - k // 2) ** 2 / (2 * s * s))
+    g = torch.exp(-((torch.arange(k, device=x.device) - k // 2) ** 2) / (2 * s * s))
     g = g / g.sum()
     x = F.conv2d(F.pad(x, (k // 2, k // 2, 0, 0), mode="reflect"), g.view(1, 1, 1, k))
     return F.conv2d(F.pad(x, (0, 0, k // 2, k // 2), mode="reflect"), g.view(1, 1, k, 1))
@@ -54,8 +54,10 @@ def bandpass(frames, lo, hi):
 
 def temporal_report(frames):
     """frames: (T, 3, H, W) in [0, 1] on CPU."""
-    out = {"sat": float(((frames < 0.02) | (frames > 0.98)).float().mean()),
-           "detail": float(bandpass(frames, 0.5, 2).std())}  # fine-detail contrast: catches averaging blur
+    out = {
+        "sat": float(((frames < 0.02) | (frames > 0.98)).float().mean()),
+        "detail": float(bandpass(frames, 0.5, 2).std()),
+    }  # fine-detail contrast: catches averaging blur
     for name, lo, hi in BANDS:
         b = bandpass(frames, lo, hi)
         d1 = b[1:] - b[:-1]
@@ -85,13 +87,24 @@ class Scorer:
         tot = 0.0
         for k in range(draws):
             random.seed(1000 + k)
-            tot = tot + torch.cat([self.act(frames[i:i + mb]) for i in range(0, len(frames), mb)])
+            tot = tot + torch.cat([self.act(frames[i : i + mb]) for i in range(0, len(frames), mb)])
         return (tot / draws).cpu().numpy()
 
 
-def string_path(sc, *, width, height, seeds=(1, 2), endpoint_steps=512,
-                schedule="6:150,13:50,27:25,55:15", lr=0.02, mb=16, arc="spectrum",
-                arc_band=(2, 32), device="cpu"):
+def string_path(
+    sc,
+    *,
+    width,
+    height,
+    seeds=(1, 2),
+    endpoint_steps=512,
+    schedule="6:150,13:50,27:25,55:15",
+    lr=0.02,
+    mb=16,
+    arc="spectrum",
+    arc_band=(2, 32),
+    device="cpu",
+):
     """Coarse-to-fine string method. ``arc`` = 'spectrum' (L2 of spectrum params) or
     'image' (L2 of band-passed luminance) decides what 'equal spacing' means."""
     helper = FourierImage(height, width, device=device)
@@ -117,7 +130,9 @@ def string_path(sc, *, width, height, seeds=(1, 2), endpoint_steps=512,
     def seglengths(chain):
         if arc == "spectrum":
             return (chain[1:] - chain[:-1]).flatten(1).norm(dim=1)
-        b = torch.cat([bandpass(image(chain[i:i + mb]), *arc_band) for i in range(0, len(chain), mb)])
+        b = torch.cat(
+            [bandpass(image(chain[i : i + mb]), *arc_band) for i in range(0, len(chain), mb)]
+        )
         return (b[1:] - b[:-1]).flatten(1).norm(dim=1)
 
     @torch.no_grad()
@@ -149,7 +164,7 @@ def string_path(sc, *, width, height, seeds=(1, 2), endpoint_steps=512,
             seed = random.randrange(1 << 30)
             for i in range(0, n, mb):
                 random.seed(seed)  # same transform for every node this step
-                (-sc.act(image(X[i:i + mb])).sum()).backward()
+                (-sc.act(image(X[i : i + mb])).sum()).backward()
             with torch.no_grad():  # climb only perpendicular to the path
                 chain = torch.cat([A, X, B])
                 tau = (chain[2:] - chain[:-2]).flatten(1)
@@ -164,28 +179,43 @@ def string_path(sc, *, width, height, seeds=(1, 2), endpoint_steps=512,
         X = respace(X)  # final spacing in the measured metric
     chain = torch.cat([A, X, B])
     with torch.no_grad():
-        return torch.cat([image(chain[i:i + mb]) for i in range(0, len(chain), mb)]).cpu()
+        return torch.cat([image(chain[i : i + mb]) for i in range(0, len(chain), mb)]).cpu()
 
 
 def morph_path(sc, *, width, height, frames=57, device="cpu", **kw):
-    imgs = morph.run_morph(sc.bb, sc.layer, kw.pop("ch_a"), kw.pop("ch_b"), np.linspace(0, 1, frames),
-                           width=width, height=height, warmup=120, device=device, collect=True, **kw)
+    imgs = morph.run_morph(
+        sc.bb,
+        sc.layer,
+        kw.pop("ch_a"),
+        kw.pop("ch_b"),
+        np.linspace(0, 1, frames),
+        width=width,
+        height=height,
+        warmup=120,
+        device=device,
+        collect=True,
+        **kw,
+    )
     return torch.cat(imgs)
 
 
 def fmt(name, rep, head, secs):
-    bands = "  ".join(f"{b}: R {rep[b]['R']:.2f} fl {rep[b]['flip']:.2f} CV {rep[b]['CV']:.2f} pk {rep[b]['pk']:.1f}"
-                      for b, _, _ in BANDS)
-    return (f"{name:>18}  {head}  sat {rep['sat']:5.1%}  detail {rep['detail']:.4f}  {secs:4.0f}s\n"
-            f"{'':>18}  {bands}")
+    bands = "  ".join(
+        f"{b}: R {rep[b]['R']:.2f} fl {rep[b]['flip']:.2f} CV {rep[b]['CV']:.2f} pk {rep[b]['pk']:.1f}"
+        for b, _, _ in BANDS
+    )
+    return (
+        f"{name:>18}  {head}  sat {rep['sat']:5.1%}  detail {rep['detail']:.4f}  {secs:4.0f}s\n"
+        f"{'':>18}  {bands}"
+    )
 
 
 MORPH = dict(method="morph", ch_a=100, ch_b=104, layer="features.7")
 CONFIGS = {
     "morph": MORPH,
-    "morph-ema.9": dict(MORPH, ema=0.9),      # ~10-step window, ~1.7 frames at 6 steps/frame
-    "morph-ema.97": dict(MORPH, ema=0.97),    # ~33-step window, ~5.5 frames
-    "morph-ema.99": dict(MORPH, ema=0.99),    # ~100-step window, ~17 frames
+    "morph-ema.9": dict(MORPH, ema=0.9),  # ~10-step window, ~1.7 frames at 6 steps/frame
+    "morph-ema.97": dict(MORPH, ema=0.97),  # ~33-step window, ~5.5 frames
+    "morph-ema.99": dict(MORPH, ema=0.99),  # ~100-step window, ~17 frames
     "morph-eps5e-5": dict(MORPH, adam_eps=5e-5),  # ~median sqrt(v) after warmup
     "morph-eps5e-4": dict(MORPH, adam_eps=5e-4),  # ~90th percentile
     "string-spectrum": dict(method="string", arc="spectrum"),
@@ -195,7 +225,9 @@ CONFIGS = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--configs", nargs="+", default=["string-spectrum", "string-image"], choices=list(CONFIGS))
+    ap.add_argument(
+        "--configs", nargs="+", default=["string-spectrum", "string-image"], choices=list(CONFIGS)
+    )
     ap.add_argument("--layer", default="features.5")
     ap.add_argument("--ch", type=int, default=42)
     ap.add_argument("--width", type=int, default=384)

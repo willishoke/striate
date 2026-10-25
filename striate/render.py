@@ -43,7 +43,9 @@ def render(
         backbone.hook(layer)
     param = FourierImage(size, size, decorrelate=decorrelate, device=device)
     transforms = transforms or TransformRobustness()
-    image = _optimize(param, backbone, objective, transforms, steps, lr, f"{size}px", progress, clip_weight)
+    image = _optimize(
+        param, backbone, objective, transforms, steps, lr, f"{size}px", progress, clip_weight
+    )
     backbone.clear_hooks()
     return image
 

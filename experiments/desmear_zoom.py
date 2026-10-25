@@ -24,8 +24,8 @@ for p in critic.parameters():
 transforms = TransformRobustness(degrees=[])
 crit_size = 160
 
-A, B = 7, 15                       # corpus indices -> channels 42 and 90
-sA, sB = spectra[A:A + 1], spectra[B:B + 1]
+A, B = 7, 15  # corpus indices -> channels 42 and 90
+sA, sB = spectra[A : A + 1], spectra[B : B + 1]
 interp = 0.5 * sA + 0.5 * sB
 
 
@@ -38,8 +38,13 @@ def render(spec):
 
 def score(img, draws=8):
     with torch.no_grad():
-        return torch.stack([torch.sigmoid(critic(prep(img, crit_size, transforms)))
-                            for _ in range(draws)]).mean().item()
+        return (
+            torch.stack(
+                [torch.sigmoid(critic(prep(img, crit_size, transforms))) for _ in range(draws)]
+            )
+            .mean()
+            .item()
+        )
 
 
 save_image(render(sA), "outputs/zoom_A.png")

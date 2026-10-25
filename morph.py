@@ -45,10 +45,31 @@ class InterpChannel:
         return -((1.0 - self.t) * act[:, self.a].mean() + self.t * act[:, self.b].mean())
 
 
-def run_morph(backbone, layer, ch_a, ch_b, t_schedule, *, width=1280, height=720,
-              steps_per_frame=8, warmup=150, lr=0.05, device="cpu", coherent=True,
-              batch=1, coherence_loss=0.0, clip_weight=0.0, freeze_cutoff=0.0,
-              freeze_width=0.03, seed=0, outdir=None, collect=False, ema=0.0, adam_eps=1e-8):
+def run_morph(
+    backbone,
+    layer,
+    ch_a,
+    ch_b,
+    t_schedule,
+    *,
+    width=1280,
+    height=720,
+    steps_per_frame=8,
+    warmup=150,
+    lr=0.05,
+    device="cpu",
+    coherent=True,
+    batch=1,
+    coherence_loss=0.0,
+    clip_weight=0.0,
+    freeze_cutoff=0.0,
+    freeze_width=0.03,
+    seed=0,
+    outdir=None,
+    collect=False,
+    ema=0.0,
+    adam_eps=1e-8,
+):
     backbone.clear_hooks()
     backbone.hook(layer)
     transforms = TransformRobustness()
@@ -128,14 +149,37 @@ def run_morph(backbone, layer, ch_a, ch_b, t_schedule, *, width=1280, height=720
     return images
 
 
-def measure_velocity(backbone, layer, ch_a, ch_b, *, n=80, width=426, height=240,
-                     steps_per_frame=4, warmup=60, lr=0.05, device="cpu",
-                     coherence_loss=0.0):
+def measure_velocity(
+    backbone,
+    layer,
+    ch_a,
+    ch_b,
+    *,
+    n=80,
+    width=426,
+    height=240,
+    steps_per_frame=4,
+    warmup=60,
+    lr=0.05,
+    device="cpu",
+    coherence_loss=0.0,
+):
     """Low-res linear-t pass; return per-frame consecutive-image MSE (the velocity)."""
-    imgs = run_morph(backbone, layer, ch_a, ch_b, np.linspace(0, 1, n),
-                     width=width, height=height, steps_per_frame=steps_per_frame,
-                     warmup=warmup, lr=lr, device=device,
-                     coherence_loss=coherence_loss, collect=True)
+    imgs = run_morph(
+        backbone,
+        layer,
+        ch_a,
+        ch_b,
+        np.linspace(0, 1, n),
+        width=width,
+        height=height,
+        steps_per_frame=steps_per_frame,
+        warmup=warmup,
+        lr=lr,
+        device=device,
+        coherence_loss=coherence_loss,
+        collect=True,
+    )
     return np.array([float(((imgs[i] - imgs[i - 1]) ** 2).mean()) for i in range(1, len(imgs))])
 
 
@@ -179,36 +223,68 @@ def main():
     p.add_argument("--transform-batch", type=int, default=1)
     p.add_argument("--no-coherent", action="store_true")
     p.add_argument("--adaptive-pacing", action="store_true")
-    p.add_argument("--freeze-cutoff", type=float, default=0.0, help="soft low-freq freeze cutoff (radial freq); 0=off")
+    p.add_argument(
+        "--freeze-cutoff",
+        type=float,
+        default=0.0,
+        help="soft low-freq freeze cutoff (radial freq); 0=off",
+    )
     p.add_argument("--freeze-width", type=float, default=0.03)
-    p.add_argument("--ema", type=float, default=0.0, help="render frames from an EMA of the iterate (decay per step); 0=off")
+    p.add_argument(
+        "--ema",
+        type=float,
+        default=0.0,
+        help="render frames from an EMA of the iterate (decay per step); 0=off",
+    )
     p.add_argument("--adam-eps", type=float, default=1e-8)
     p.add_argument("--outdir", default="outputs/morph_frames")
     p.add_argument("--strip", default="outputs/morph_strip.png")
     args = p.parse_args()
 
     device = pick_device()
-    print(f"device: {device}  morph {args.layer} ch{args.from_ch} -> ch{args.to_ch} "
-          f"@ {args.width}x{args.height} x{args.frames}  lambda={args.coherence_loss}")
+    print(
+        f"device: {device}  morph {args.layer} ch{args.from_ch} -> ch{args.to_ch} "
+        f"@ {args.width}x{args.height} x{args.frames}  lambda={args.coherence_loss}"
+    )
     backbone = Backbone(args.model, device=device)
 
     t0 = time.time()
     if args.adaptive_pacing:
         print("  measuring velocity (low-res pre-pass)...")
-        vel = measure_velocity(backbone, args.layer, args.from_ch, args.to_ch,
-                               device=device, coherence_loss=args.coherence_loss)
+        vel = measure_velocity(
+            backbone,
+            args.layer,
+            args.from_ch,
+            args.to_ch,
+            device=device,
+            coherence_loss=args.coherence_loss,
+        )
         t_sched = pacing_schedule(vel, args.frames)
         print(f"  pacing: velocity ratio max/min = {vel.max() / max(vel.min(), 1e-9):.1f}")
     else:
         t_sched = np.linspace(0, 1, args.frames)
 
-    run_morph(backbone, args.layer, args.from_ch, args.to_ch, t_sched,
-              width=args.width, height=args.height, steps_per_frame=args.steps_per_frame,
-              warmup=args.warmup, lr=0.05, device=device,
-              coherent=not args.no_coherent, batch=args.transform_batch,
-              coherence_loss=args.coherence_loss, freeze_cutoff=args.freeze_cutoff,
-              freeze_width=args.freeze_width, outdir=args.outdir, ema=args.ema,
-              adam_eps=args.adam_eps)
+    run_morph(
+        backbone,
+        args.layer,
+        args.from_ch,
+        args.to_ch,
+        t_sched,
+        width=args.width,
+        height=args.height,
+        steps_per_frame=args.steps_per_frame,
+        warmup=args.warmup,
+        lr=0.05,
+        device=device,
+        coherent=not args.no_coherent,
+        batch=args.transform_batch,
+        coherence_loss=args.coherence_loss,
+        freeze_cutoff=args.freeze_cutoff,
+        freeze_width=args.freeze_width,
+        outdir=args.outdir,
+        ema=args.ema,
+        adam_eps=args.adam_eps,
+    )
     strip(args.outdir, args.frames, args.strip)
     print(f"done in {time.time() - t0:.0f}s  frames -> {args.outdir}  strip -> {args.strip}")
 
