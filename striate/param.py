@@ -96,7 +96,7 @@ class FourierImage(torch.nn.Module):
 
     def _decorrelate_color(self, image: torch.Tensor) -> torch.Tensor:
         mat = color_correlation_normalized.to(image.device)
-        b, c, h, w = image.shape
+        b, _, h, w = image.shape
         flat = image.permute(0, 2, 3, 1).reshape(-1, 3)
         flat = flat @ mat.T
         return flat.reshape(b, h, w, 3).permute(0, 3, 1, 2)
@@ -116,7 +116,7 @@ def seed_spectrum_from_image(param: FourierImage, image: torch.Tensor) -> Fourie
     if param.decorrelate:
         mat = color_correlation_normalized.to(image.device)
         inv = torch.linalg.inv(mat)
-        b, c, h, w = pre.shape
+        b, _, h, w = pre.shape
         flat = pre.permute(0, 2, 3, 1).reshape(-1, 3) @ inv.T
         pre = flat.reshape(b, h, w, 3).permute(0, 3, 1, 2)
 

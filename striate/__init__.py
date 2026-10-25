@@ -5,4 +5,4 @@ import os as _os
 
 _os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-__all__ = ["param", "transforms", "model", "objectives", "render", "util"]
+__all__ = ["model", "objectives", "param", "render", "transforms", "util"]

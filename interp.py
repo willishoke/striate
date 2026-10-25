@@ -17,13 +17,13 @@ import argparse
 
 import numpy as np
 import torch
-from PIL import Image, ImageDraw
+from PIL import Image
 from tqdm import trange
 
 from striate.model import Backbone
 from striate.param import FourierImage, _rfft2d_freqs
-from striate.util import pick_device, save_image
 from striate.transforms import TransformRobustness
+from striate.util import pick_device, save_image
 
 
 def run_interp(bb, layer, ch_a, ch_b, *, N, size, steps, align_weight, lr,

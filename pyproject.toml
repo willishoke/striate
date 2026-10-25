@@ -25,3 +25,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["striate"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+# experiments/ is research code: formatted, but not held to lint
+exclude = ["experiments/**"]
+# dict(BASE, key=val) reads better than {**BASE, "key": val} in config tables
+ignore = ["C408"]

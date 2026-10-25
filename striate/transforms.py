@@ -34,7 +34,7 @@ class TransformRobustness:
         x = self._jitter(x, self.jitter)
 
         scale = random.choice(self.scales)
-        nh, nw = int(round(x.shape[2] * scale)), int(round(x.shape[3] * scale))
+        nh, nw = round(x.shape[2] * scale), round(x.shape[3] * scale)
         x = F.interpolate(x, size=(nh, nw), mode="bilinear", align_corners=False)
 
         if self.degrees:  # rotation is the lone grid_sample (CPU fallback on MPS); skippable

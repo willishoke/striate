@@ -61,7 +61,7 @@ def main():
         if args.width and args.height:
             # octave schedule scaled to the target aspect ratio
             tw, th = args.width, args.height
-            sizes = [(int(round(th * f)), int(round(tw * f))) for f in (0.25, 0.5, 0.75, 1.0)]
+            sizes = [(round(th * f), round(tw * f)) for f in (0.25, 0.5, 0.75, 1.0)]
         else:
             sizes = tuple(int(s) for s in args.sizes.split(","))
         image = render_progressive(
