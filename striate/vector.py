@@ -16,6 +16,16 @@ outline: low harmonics (overall shape) move first, high ones (petals, spikes) la
 Rendering is analytic in the pixel coordinate, so the robustness transforms are
 applied to the sampling grid (a random camera) rather than resampling a raster:
 the network sees crisp edges at every step.
+
+Field mode (``field > 0``) trades the opaque poster look for piecewise-smooth color.
+A band-limited Fourier color field (at most ``field`` cycles across the image) sits
+under the shapes, and each shape paints an *offset* from it rather than a color of
+its own: a shape with zero offset is invisible, its boundary dissolved into the
+field. Penalizing the offsets (``edge_cost``) makes every visible edge pay for
+itself in activation. With ``learn_softness`` each shape also learns its own edge
+width in image units, from a hairline to a broad feather. Field mode composites in
+the pre-sigmoid color space, which SVG cannot express, so it has no ``to_svg``;
+``render`` stays analytic and resolution-free.
 """
 
 import math
@@ -30,6 +40,9 @@ from .param import color_correlation_normalized
 _CENTER_SCALE = 0.1
 _LOG_RADIUS_SCALE = 0.2
 _HARMONIC_SCALE = 0.3
+_FIELD_SCALE = 1.0
+# learned edge widths live in (0, _SOFT_MAX) image heights
+_SOFT_MAX = 0.1
 
 
 class VectorImage(torch.nn.Module):
@@ -42,6 +55,8 @@ class VectorImage(torch.nn.Module):
         learn_alpha: bool = False,
         decorrelate: bool = True,
         radius_range: tuple[float, float] = (0.03, 0.35),
+        field: int = 0,
+        learn_softness: bool = False,
         device: str = "cpu",
     ):
         super().__init__()
@@ -58,7 +73,11 @@ class VectorImage(torch.nn.Module):
             fill=fill,
             learn_alpha=learn_alpha,
             decorrelate=decorrelate,
+            field=field,
+            learn_softness=learn_softness,
         )
+        self.field = field
+        self.learn_softness = learn_softness
         k = shapes
 
         lo, hi = math.log(radius_range[0]), math.log(radius_range[1])
@@ -68,10 +87,23 @@ class VectorImage(torch.nn.Module):
         self.center = torch.nn.Parameter(torch.rand(k, 2) / _CENTER_SCALE)
         self.harm = torch.nn.Parameter(torch.randn(k, harmonics, 2) * 0.3)
         ncolors = 2 if fill == "linear" else 1
-        self.color = torch.nn.Parameter(torch.randn(k, ncolors, 3) * 0.5)
+        # in field mode these are pre-sigmoid offsets from the field, started faint
+        self.color = torch.nn.Parameter(torch.randn(k, ncolors, 3) * (0.3 if field else 0.5))
         self.grad_angle = torch.nn.Parameter(torch.rand(k) * 2 * math.pi)
         self.alpha = torch.nn.Parameter(torch.full((k,), 2.0), requires_grad=learn_alpha)
         self.background = torch.nn.Parameter(torch.zeros(3))
+        # edge width starts at ~0.002 image heights: under half a pixel at 224
+        self.soft = torch.nn.Parameter(torch.full((k,), -3.9), requires_grad=learn_softness)
+
+        # field: the integer frequencies (fx, fy) with |f| <= field, one of each +-f
+        # pair, preconditioned by 1/|f| like FourierImage. The background is its DC.
+        r = torch.arange(-field, field + 1, dtype=torch.float32)
+        freqs = torch.stack(torch.meshgrid(r, r, indexing="xy"), -1).reshape(-1, 2)
+        half = (freqs[:, 1] > 0) | ((freqs[:, 1] == 0) & (freqs[:, 0] > 0))
+        freqs = freqs[half & (freqs.norm(dim=-1) <= field)]
+        self.register_buffer("field_freqs", freqs)
+        self.register_buffer("field_scale", _FIELD_SCALE / freqs.norm(dim=-1).clamp(min=1))
+        self.field_coef = torch.nn.Parameter(torch.randn(len(freqs), 2, 3) * 0.05)
 
         orders = torch.arange(1, harmonics + 1, dtype=torch.float32)
         self.register_buffer("harm_scale", _HARMONIC_SCALE / orders**decay)
@@ -86,7 +118,11 @@ class VectorImage(torch.nn.Module):
     def load(cls, path: str, device: str = "cpu") -> "VectorImage":
         saved = torch.load(path, map_location=device)
         image = cls(**saved["config"], device=device)
-        image.load_state_dict(saved["state"])
+        missing, unexpected = image.load_state_dict(saved["state"], strict=False)
+        # saves from before field mode lack its tensors; their defaults reproduce them
+        newer = {"soft", "field_freqs", "field_scale", "field_coef"}
+        if unexpected or set(missing) - newer:
+            raise RuntimeError(f"bad VectorImage state: missing {missing}, unexpected {unexpected}")
         return image
 
     # --- geometry, in image units -------------------------------------------------
@@ -111,6 +147,26 @@ class VectorImage(torch.nn.Module):
 
     def opacity(self) -> torch.Tensor:
         return torch.sigmoid(self.alpha) if self.learn_alpha else torch.ones_like(self.alpha)
+
+    def edge_width(self) -> torch.Tensor:
+        """Learned edge width of every shape, in image heights (K,)."""
+        return _SOFT_MAX * torch.sigmoid(self.soft)
+
+    def offset_norm(self) -> torch.Tensor:
+        """How far each shape's paint departs from the field (K,): zero is invisible."""
+        return self.color.flatten(1).norm(dim=-1)
+
+    def field_preact(self, grid: torch.Tensor) -> torch.Tensor:
+        """The base field at sample points ``grid`` (..., 2) -> (..., 3), before the
+        color decorrelation and sigmoid."""
+        phase = 2 * math.pi * grid @ self.field_freqs.T  # (..., F)
+        coef = self.field_coef * self.field_scale[:, None, None]
+        return self.background + torch.cos(phase) @ coef[:, 0] + torch.sin(phase) @ coef[:, 1]
+
+    def _to_rgb(self, pre: torch.Tensor) -> torch.Tensor:
+        if self.decorrelate:
+            pre = pre @ color_correlation_normalized.to(pre.device).T
+        return torch.sigmoid(pre)
 
     # --- rendering ----------------------------------------------------------------
 
@@ -148,10 +204,13 @@ class VectorImage(torch.nn.Module):
         d = grid[:, :, None, :] - self.centers()  # (H, W, K, 2)
         rho = torch.sqrt((d * d).sum(-1) + 1e-12)
         theta = torch.atan2(d[..., 1], d[..., 0])
-        edge = (self.radius(theta) - rho) * height / max(softness, 1e-3)
-        cover = torch.sigmoid(edge) * self.opacity()  # (H, W, K)
+        width = max(softness, 1e-3) / height  # the annealed floor, in image heights
+        if self.learn_softness:
+            width = torch.sqrt(self.edge_width() ** 2 + width**2)
+        cover = torch.sigmoid((self.radius(theta) - rho) / width) * self.opacity()  # (H, W, K)
 
-        colors = self.fills()
+        # field mode paints pre-sigmoid offsets; otherwise each shape has its own color
+        colors = self.color if self.field else self.fills()
         if self.fill == "linear":
             ang = self.grad_angle
             direction = torch.stack([torch.cos(ang), torch.sin(ang)], -1)  # (K, 2)
@@ -166,6 +225,8 @@ class VectorImage(torch.nn.Module):
         after = torch.flip(torch.cumsum(torch.flip(log_clear, [-1]), -1), [-1]) - log_clear
         weight = cover * torch.exp(after)  # (H, W, K)
         image = (weight[..., None] * paint).sum(2)
+        if self.field:
+            return self._to_rgb(self.field_preact(grid) + image)
         image = image + torch.exp(log_clear.sum(-1, keepdim=True)) * torch.sigmoid(self.background)
         return image
 
@@ -174,6 +235,8 @@ class VectorImage(torch.nn.Module):
     @torch.no_grad()
     def to_svg(self, height: int, width: int, samples: int = 256) -> str:
         """The exact shapes as an SVG document (outlines sampled as polygons)."""
+        if self.field:
+            raise NotImplementedError("field mode composites in pre-sigmoid color; no SVG form")
         theta = torch.linspace(0, 2 * math.pi, samples + 1, device=self.center.device)[:-1]
         radii = self.radius(theta[:, None].expand(-1, self.center.shape[0])).T  # (K, S)
         centers = self.centers()

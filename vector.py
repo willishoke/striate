@@ -21,7 +21,7 @@ from tqdm import trange
 from striate.model import Backbone
 from striate.objectives import ChannelObjective
 from striate.util import pick_device, save_image
-from striate.vector import VectorImage, random_camera
+from striate.vector import _SOFT_MAX, VectorImage, random_camera
 
 
 def optimize(
@@ -35,6 +35,8 @@ def optimize(
     soft_start: float,
     soft_end: float,
     device: str,
+    edge_cost: float = 0.0,
+    soft_cost: float = 0.0,
     progress: bool = True,
 ):
     params = [p for p in image.parameters() if p.requires_grad]
@@ -46,6 +48,12 @@ def optimize(
         optimizer.zero_grad()
         x = image.render(size, size, softness, camera=random_camera(device=device))
         loss = objective(backbone(x))
+        if edge_cost or soft_cost:
+            # costs are fractions of the current activation, so one setting means
+            # the same trade on channels whose activations differ in scale
+            cost = edge_cost * image.offset_norm().mean()
+            cost = cost + soft_cost * image.edge_width().mean() / _SOFT_MAX
+            loss = loss + loss.detach().abs() * cost
         loss.backward()
         optimizer.step()
     return image
@@ -65,6 +73,17 @@ def main():
     p.add_argument("--fill", default="linear", choices=["flat", "linear"])
     p.add_argument("--no-decorrelate", action="store_true", help="optimize fills in raw RGB")
     p.add_argument("--alpha", action="store_true", help="learn per-shape opacity")
+    p.add_argument(
+        "--field",
+        type=int,
+        default=0,
+        help="smooth base field up to N cycles; shapes paint offsets",
+    )
+    p.add_argument("--learn-softness", action="store_true", help="learn per-shape edge width")
+    p.add_argument(
+        "--edge-cost", type=float, default=0.0, help="penalty on shape offsets from the field"
+    )
+    p.add_argument("--soft-cost", type=float, default=0.0, help="penalty on learned edge width")
     p.add_argument("--size", type=int, default=224, help="optimization resolution")
     p.add_argument("--steps", type=int, default=512)
     p.add_argument("--lr", type=float, default=0.05)
@@ -87,6 +106,8 @@ def main():
         learn_alpha=args.alpha,
         decorrelate=not args.no_decorrelate,
         radius_range=tuple(float(r) for r in args.radius.split(",")),
+        field=args.field,
+        learn_softness=args.learn_softness,
         device=device,
     )
     t0 = time.time()
@@ -100,6 +121,8 @@ def main():
         soft_start=args.soft_start,
         soft_end=args.soft_end,
         device=device,
+        edge_cost=args.edge_cost,
+        soft_cost=args.soft_cost,
     )
     objective = ChannelObjective(args.layer, args.channel)
     with torch.no_grad():
@@ -112,17 +135,27 @@ def main():
             for _ in range(16)
         ]
     print(f"activation {sum(acts) / len(acts):.3f} (mean over 16 random cameras)")
+    if args.field:
+        with torch.no_grad():
+            norm = image.offset_norm()
+            width = image.edge_width() * args.out_size
+        print(
+            f"offsets: mean {norm.mean():.3f}, visible (>0.1) {(norm > 0.1).float().mean():.0%}"
+            f"; edge width at {args.out_size}px: median {width.median():.1f}px"
+        )
     backbone.clear_hooks()
 
     prefix = args.out or f"outputs/vector_{args.layer.replace('.', '-')}_ch{args.channel}"
     os.makedirs(os.path.dirname(prefix) or ".", exist_ok=True)
     image.save(prefix + ".pt")
-    with open(prefix + ".svg", "w") as f:
-        f.write(image.to_svg(args.out_size, args.out_size))
+    if not args.field:
+        with open(prefix + ".svg", "w") as f:
+            f.write(image.to_svg(args.out_size, args.out_size))
     with torch.no_grad():
         # half-pixel edges at the output size: antialiased, not blurred
         save_image(image.render(args.out_size, args.out_size, 0.5), prefix + ".png")
-    print(f"saved: {prefix}.svg, .png, .pt  ({time.time() - t0:.0f}s)")
+    kinds = ".png, .pt" if args.field else ".svg, .png, .pt"
+    print(f"saved: {prefix}{kinds}  ({time.time() - t0:.0f}s)")
 
 
 if __name__ == "__main__":
