@@ -12,7 +12,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 import argparse
 
-from .model import Backbone
+from .model import NETS, Backbone
 from .objectives import ChannelObjective, LayerObjective, NeuronObjective
 from .render import render, render_progressive
 from .util import pick_device, save_image
@@ -30,7 +30,9 @@ def main():
     p = argparse.ArgumentParser(
         description="Modern hi-res feature visualization (Distill 2017 method)."
     )
-    p.add_argument("--model", default="tiny", choices=["tiny", "small", "base"])
+    p.add_argument(
+        "--model", default="tiny", choices=list(NETS), help="tiny/small/base are ConvNeXt"
+    )
     p.add_argument("--layer", default="features.5", help="module path, e.g. features.5")
     p.add_argument("--channel", type=int, default=0)
     p.add_argument("--objective", default="channel", choices=["channel", "layer", "neuron"])
@@ -51,7 +53,7 @@ def main():
     args = p.parse_args()
 
     device = pick_device()
-    print(f"device: {device}  model: convnext_{args.model}")
+    print(f"device: {device}  model: {args.model}")
     backbone = Backbone(args.model, device=device)
 
     if args.list_layers:
