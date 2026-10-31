@@ -4,6 +4,9 @@ outputs/
 # downloaded model weights (Real-ESRGAN etc. — fetched, not versioned)
 models/
 
+# trained stills, labels and paths for the cell warp loop (rebuilt from the scripts)
+experiments/loops/assets/
+
 # environments / caches
 .venv/
 __pycache__/
