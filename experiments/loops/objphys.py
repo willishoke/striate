@@ -615,7 +615,8 @@ def main():
                 for L_, f_ in snet(alb_).items():
                     mm = F.adaptive_avg_pool2d(m_, f_.shape[-2:])[:, 0]
                     f_ = f_ / (f_.detach().pow(2).mean((0, 2, 3), keepdim=True).sqrt() + 1e-6)
-                    gram = lambda w_: torch.einsum("kchw,kdhw,khw->kcd", f_, f_, w_) / w_.sum((1, 2))[:, None, None].clamp(min=1e-3)
+                    ff = f_.flatten(2)
+                    gram = lambda w_: torch.bmm(ff * w_.flatten(1)[:, None], ff.transpose(1, 2)) / w_.sum((1, 2))[:, None, None].clamp(min=1e-3)
                     mean = lambda w_: torch.einsum("kchw,khw->kc", f_, w_) / w_.sum((1, 2))[:, None].clamp(min=1e-3)
                     Gg, Gb = gram(mm).detach(), gram(1 - mm)
                     Mg, Mb = mean(mm).detach(), mean(1 - mm)
