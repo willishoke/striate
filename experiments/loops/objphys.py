@@ -56,7 +56,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z
+from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z, with_dir
 
 
 # ---------------------------------------------------------------- physics (CPU, float64)
@@ -377,6 +377,17 @@ def main():
     ap.add_argument("--outline-w", type=float, default=2.0)
     ap.add_argument("--ao", type=float, default=None, help="ambient occlusion strength (default: the checkpoint's)")
     ap.add_argument("--lr-prior", type=float, default=0.0, help="also train the wrapped-still prior texture at this rate")
+    ap.add_argument("--bump-amp", type=float, default=None, help="fine relief on the texture's grid, px (default: the checkpoint's; 0 off)")
+    ap.add_argument("--bump-around", type=int, default=64)
+    ap.add_argument("--bump-along", type=int, default=144)
+    ap.add_argument("--cavity", type=float, default=None, help="pits in the fine relief darken by exp(-this * depth px) (default: the checkpoint's)")
+    ap.add_argument("--cav-r", type=int, default=3)
+    ap.add_argument("--train-light", type=float, default=0.0, help="training: each sample's key light turns up to this many degrees in azimuth and drops up to half of it in elevation, so shading painted for one light fails the rest")
+    ap.add_argument("--light-swing", type=float, default=0.0, help="render: the key light swings this many degrees in azimuth (and a quarter of it in elevation) over the loop")
+    ap.add_argument("--bump-rim", type=float, default=None, help="relief displacement fades toward the outline (default: the checkpoint's)")
+    ap.add_argument("--lr-bump", type=float, default=0.0, help="training: the fine relief's rate")
+    ap.add_argument("--whf", type=float, default=0.0, help="training: penalty on the paint's fine luminance detail (relative to its start), so the detail moves into the relief")
+    ap.add_argument("--hf-r", type=int, default=3, help="--whf: fine = finer than this many texels")
     ap.add_argument("--grow", default=None, help="textures grown by a lipgrow.py rule (its .pt): with --train, the rule trains instead of the paint")
     ap.add_argument("--lr-grow", type=float, default=1e-3, help="training: the growth rule's rate")
     a = ap.parse_args()
@@ -398,6 +409,15 @@ def main():
             setattr(ta, n_, getattr(a, n_))
     if a.outline is not None:
         ta.outline, ta.outline_w = a.outline, a.outline_w
+    if a.bump_amp is not None:  # the relief's settings travel with the checkpoint, so it reloads with its relief
+        ta.bump_amp, ta.bump_around, ta.bump_along = a.bump_amp, a.bump_around, a.bump_along
+        ck["args"] = {**ck["args"], "bump_amp": a.bump_amp, "bump_around": a.bump_around, "bump_along": a.bump_along}
+    if a.bump_rim is not None:
+        ta.bump_rim = a.bump_rim
+        ck["args"] = {**ck["args"], "bump_rim": a.bump_rim}
+    if a.cavity is not None:
+        ta.cavity, ta.cav_r = a.cavity, a.cav_r
+        ck["args"] = {**ck["args"], "cavity": a.cavity, "cav_r": a.cav_r}
     cpu = torch.device("cpu")
     tb0 = Mixed.from_state(ck["tubes"], ta, cpu)
     is_filler = ck["tubes"].get("is_filler")
@@ -527,6 +547,16 @@ def main():
             del tb.tex0
             tb.tex0 = torch.nn.Parameter(t0_)
             groups.append({"params": [tb.tex0], "lr": a.lr_prior})
+        if a.lr_bump > 0 and hasattr(tb, "bump"):
+            groups.append({"params": [tb.bump], "lr": a.lr_bump})
+
+        def paint_hf():  # the prior paint's luminance finer than --hf-r texels (wrapping around)
+            Y_ = (torch.sigmoid(tb.tex0) * torch.tensor([0.299, 0.587, 0.114], device=dev)[:, None, None]).sum(1, keepdim=True)
+            r_ = a.hf_r
+            Yp = F.pad(torch.cat([Y_[:, :, -r_:], Y_, Y_[:, :, :r_]], 2), (r_, r_, 0, 0), mode="replicate")
+            return (Y_ - F.avg_pool2d(Yp, 2 * r_ + 1, stride=1)).pow(2).mean()
+
+        hf0 = float(paint_hf()) if a.whf > 0 else 1.0
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
@@ -549,11 +579,16 @@ def main():
                 tb.tex0 = grower(size=tsz)
             acts, pens = [], []
             for sp, pr, cm in zip(sps, prs, cams):
+                lt_ = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in ref.items()}
+                if a.train_light > 0:
+                    az_ = math.atan2(float(lt_["l"][1]), float(lt_["l"][0])) + math.radians(rng.uniform(-a.train_light, a.train_light))
+                    el_ = math.asin(max(-1.0, min(1.0, float(lt_["l"][2])))) - math.radians(rng.uniform(0, a.train_light / 2))
+                    lt_ = with_dir(lt_, az_, max(el_, math.radians(15)))
                 if a.train_turn > 0:  # textures that hold up turned and slid on their bodies: paint all the way round
                     sp = dict(sp)
                     sp["tex_shift"] = torch.stack([(torch.rand(tb.K, device=dev) * 2 - 1) * a.train_turn,
                                                    (torch.rand(tb.K, device=dev) * 2 - 1) * a.train_turn / 2], -1)
-                o = render(tb, sp, cm, pr, [{k: (v.detach() if torch.is_tensor(v) else v) for k, v in ref.items()}], ta, aux=True)
+                o = render(tb, sp, cm, pr, [lt_], ta, aux=True)
                 acts.append(rg.act(MultiScaleCrop(224 / S, 512)(o["img"])))
                 # paint may not do the geometry's job: no texture darker than --dark-floor, and none darker
                 # toward a body's limb than 75% of its front (objtube.py's rim term)
@@ -569,6 +604,8 @@ def main():
                 pens.append(a.wrim * rim + a.wdark * dark)
             act = torch.stack(acts).mean()
             pen = torch.stack(pens).mean()
+            if a.whf > 0:
+                pen = pen + a.whf * paint_hf() / hf0
             opt.zero_grad()
             (-act + act.detach().abs() * pen).backward()
             opt.step()
@@ -605,7 +642,14 @@ def main():
             Z = int(round(a.zoom * S))  # output size: --zoom 2 renders the same view at 1024 px
             camR = Cam(np.eye(3), Z, Z, (S / 2, S / 2, 0.0), S, zoom=a.zoom)
             down = (lambda x: F.interpolate(x, size=(S, S), mode="area")) if Z != S else (lambda x: x)
+            ref0 = ref
+            az0 = math.atan2(float(ref0["l"][1]), float(ref0["l"][0]))
+            el0 = math.asin(max(-1.0, min(1.0, float(ref0["l"][2]))))
             for t in range(a.frames):
+                if a.light_swing:  # a moving key light: painted shading can't follow it, relief does
+                    ph = 2 * math.pi * t / a.frames
+                    sw = math.radians(a.light_swing)
+                    ref = with_dir(ref0, az0 + sw * math.sin(ph), min(max(el0 + sw / 4 * math.sin(2 * ph), math.radians(10)), math.radians(85)))
                 sp = frame_sph(t)
                 pr = padded(build_pairs(sp, camR, 4.0))
                 fr = render_ss(tb, sp, camR, pr, ref, ta) if a.ss else render(tb, sp, camR, pr, [ref], ta)

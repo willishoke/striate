@@ -155,6 +155,8 @@ class Tubes(torch.nn.Module):
         self.Mr = torch.tensor(lin_matrix(rad.shape[1], a.nsph), dtype=torch.float32, device=dev)
         self.register_buffer("logr0", self.logr.detach().clone())  # the fitted size: growth beyond it is bounded
         self.disp = torch.nn.Parameter(torch.zeros(K, getattr(a, "disp_around", 8), getattr(a, "disp_along", 12), device=dev))
+        if getattr(a, "bump_amp", 0.0) > 0:  # fine relief on the texture's grid: the pattern as geometry, not paint
+            self.bump = torch.nn.Parameter(torch.zeros(K, a.bump_around, a.bump_along, device=dev))
 
     def f(self):
         return 0.25 + torch.sigmoid(self.fq)
@@ -217,7 +219,8 @@ class Tubes(torch.nn.Module):
             Bs.append(b / (b.norm(dim=-1, keepdim=True) + 1e-6))
         Bv = torch.stack(Bs, -2)
         out = dict(C=C, r=r, T=T, Bv=Bv, s=s, s_lo=-r[:, 0], s_len=Lt + r[:, 0] + r[:, -1], f=f,
-                   disp=getattr(self.a, "disp_amp", 0.0) * torch.tanh(self.disp) if hasattr(self, "disp") else None)
+                   disp=getattr(self.a, "disp_amp", 0.0) * torch.tanh(self.disp) if hasattr(self, "disp") else None,
+                   bump=self.a.bump_amp * torch.tanh(self.bump) if hasattr(self, "bump") else None)
         if sub is not None:
             out = {k: (None if v is None else v[:, sub] if k in ("C", "T", "Bv") else v[sub]) for k, v in out.items()}
         return out
@@ -285,6 +288,8 @@ class Mixed(Tubes):
         super().__init__(ctl, rad, a, dev)
         self.coil = Coils(P, hand, a, dev)
         del self.coil.tex, self.coil.ground, self.coil.disp
+        if hasattr(self.coil, "bump"):
+            del self.coil.bump
         self.register_buffer("is_coil", torch.tensor(is_coil, dtype=torch.bool, device=dev))
 
     def base(self):
@@ -962,13 +967,17 @@ class BodyLight(torch.nn.Module):
 S_BLEND = 6.0  # px of arclength over which neighbouring spheres share texture coordinates
 
 
-def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None):
+def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None, bump=None, bshift=None, brim=0.0):
     """Per pixel-body pair (B, P, 8): front depth w, coverage, normal (3), arclength along the spine,
     and the two around-the-tube components of the hit, each blended over the body's spheres.
     disp (K, Ga, Gl) px: a radial displacement in tube coordinates (around x along). A first pass
     finds where each ray meets each sphere; the sphere's radius there is displaced, and the hit,
     coverage and normal recomputed (the normal tilted by the displacement's slope around the tube;
-    along the tube the union of spheres carries it)."""
+    along the tube the union of spheres carries it).
+    bump (K, Gb, Lb) px: fine relief on the texture's grid, at the hit's own arclength, turned and slid
+    with the paint (bshift, as render's tex_shift); it tilts the normal both ways. brim > 0: its
+    displacement fades out toward the outline (full where the surface faces the viewer more than
+    brim), so the outline stays clean while the shading keeps the relief."""
     q = X0[None, :, None, :] - C[:, obj]  # (B, P, N, 3)
     fk = f[obj][None, :, None]
     ez = e[2] / fk
@@ -980,17 +989,34 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     Bk, Nk, Tk = Bv[:, obj], Nv[:, obj], T[:, obj]
     w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)  # front hit, toward the viewer
     g = q + w[..., None] * e  # hit minus centre, world
-    dth = None
-    if disp is not None:
-        Ga = disp.shape[1]
+    dth = dsl = None
+    if disp is not None or bump is not None:
         th = torch.atan2((g * Nk).sum(-1), (g * Bk).sum(-1))
         tv = ((s - s_lo[:, None]) / s_len[:, None])[obj][None].expand_as(th)
         kk = obj[None, :, None].expand_as(th)
-        dk = disp[:, None]
         tu = th / (2 * math.pi) % 1.0
-        h = 0.5 / Ga
-        dl = tex_sample(dk, kk, tu, tv)[..., 0]
-        dth = (tex_sample(dk, kk, (tu + h) % 1.0, tv)[..., 0] - tex_sample(dk, kk, (tu - h) % 1.0, tv)[..., 0]) / (2 * h * 2 * math.pi)
+        dl, dth = 0.0, 0.0
+        if disp is not None:
+            Ga = disp.shape[1]
+            dk = disp[:, None]
+            h = 0.5 / Ga
+            dl = tex_sample(dk, kk, tu, tv)[..., 0]
+            dth = (tex_sample(dk, kk, (tu + h) % 1.0, tv)[..., 0] - tex_sample(dk, kk, (tu - h) % 1.0, tv)[..., 0]) / (2 * h * 2 * math.pi)
+        if bump is not None:
+            Gb, Lb = bump.shape[1:]
+            bk = bump[:, None]
+            slen = s_len[obj][None, :, None]
+            bv = ((s[obj][None] + (g * Tk).sum(-1)) - s_lo[obj][None, :, None]) / slen  # the hit's own arclength
+            bu = tu
+            if bshift is not None:
+                bu, bv = (tu + bshift[obj, 0][None, :, None]) % 1.0, bv + bshift[obj, 1][None, :, None]
+            hu, hl = 0.5 / Gb, 0.5 / (Lb - 1)
+            bl = tex_sample(bk, kk, bu, bv)[..., 0]
+            if brim > 0:
+                bl = bl * (((g * e).sum(-1) / rk).clamp(min=0) / brim).clamp(max=1)
+            dl = dl + bl
+            dth = dth + (tex_sample(bk, kk, (bu + hu) % 1.0, bv)[..., 0] - tex_sample(bk, kk, (bu - hu) % 1.0, bv)[..., 0]) / (2 * hu * 2 * math.pi)
+            dsl = (tex_sample(bk, kk, bu, bv + hl)[..., 0] - tex_sample(bk, kk, bu, bv - hl)[..., 0]) / (2 * hl * slen)
         rk = (rk + dl).clamp(min=0.5)
         w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)
         g = q + w[..., None] * e
@@ -1001,6 +1027,9 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
         gp = g - (g * Tk).sum(-1, keepdim=True) * Tk
         eth = torch.cross(Tk, gp / (gp.norm(dim=-1, keepdim=True) + 1e-6), dim=-1)
         nrm = nrm - (dth / rk)[..., None] * eth
+        nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-6)
+    if dsl is not None:  # the relief's slope along the spine
+        nrm = nrm - dsl[..., None] * Tk
         nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-6)
     # front-most covering sphere wins, softly. A sphere the ray misses still has a depth (where the ray
     # passes closest), so it must count only by its coverage: else a part of the body rising toward the
@@ -1048,7 +1077,7 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     zh = torch.tensor([0.0, 0.0, 1.0], device=dev)
     Bv = sph["Bv"]  # per sphere: across the tube (transported "up"), and the side direction
     Nv = torch.cross(T, Bv, dim=-1)
-    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"])
+    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"], sph.get("bump"), sph.get("tex_shift"), getattr(a, "bump_rim", 0.0))
     outs = []
     for i in range(0, pix.shape[0], a.chunk):
         sl_ = slice(i, i + a.chunk)
@@ -1080,6 +1109,17 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
             alb = torch.stack([Y_ + 0.956 * I2 + 0.621 * Q2, Y_ - 0.272 * I2 - 0.647 * Q2, Y_ - 1.106 * I2 + 1.703 * Q2], -1).clamp(0, 1)
     else:
         alb = torch.full((B, pix.shape[0], 3), clay, device=dev)
+    cav = None
+    if sph.get("bump") is not None and getattr(a, "cavity", 0.0) > 0:
+        # cavity: how far the relief sits below its own surroundings (px), so a pit darkens by its depth,
+        # clay or painted, and turns with it
+        bm, rr_ = sph["bump"], int(getattr(a, "cav_r", 3))
+        bp = torch.cat([bm[:, -rr_:], bm, bm[:, :rr_]], 1)[:, None]
+        bb = F.avg_pool2d(F.pad(bp, (rr_, rr_, 0, 0), mode="replicate"), 2 * rr_ + 1, stride=1)[:, 0]
+        cu, cv = tu, tv
+        if "tex_shift" in sph:
+            cu, cv = (tu + sph["tex_shift"][obj, 0]) % 1.0, tv + sph["tex_shift"][obj, 1]
+        cav = tex_sample(torch.relu(bb - bm)[:, None], obj[None].expand(B, -1), cu, cv)[..., 0]  # (B, P)
     # ground: the plane z = 0 seen through every pixel
     yy, xx = torch.meshgrid((torch.arange(H, device=dev).float() - H / 2 + off[0]) / zm, (torch.arange(W, device=dev).float() - W / 2 + off[1]) / zm, indexing="ij")
     uu, vv = xx.reshape(-1), yy.reshape(-1)
@@ -1120,6 +1160,9 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
             bt, bd = bt[sub], bd[sub]
         feats += [bt[obj][None].expand(B, -1, -1), bd[obj][None].expand(B, -1, -1)]
         gfeats += [torch.ones(B, H * W, 3, device=dev), torch.zeros(B, H * W, 3, device=dev)]
+    if cav is not None:
+        feats += [cav[..., None]]
+        gfeats += [torch.zeros(B, H * W, 1, device=dev)]
     feat = torch.cat(feats, -1) * ep[..., None]
     nf = feat.shape[-1]
     num = torch.zeros(B, H * W, nf, device=dev).index_add_(1, pix, feat)
@@ -1164,6 +1207,8 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         expo = (a0 + rg["dif"]) / (a0 + rg["dif"] * l[2])
         tint = rg["tint"][None] * tp
         ao = (1 - occ[bi])[:, None]
+        if cav is not None:
+            ao = ao * torch.exp(-a.cavity * comp[bi, :, -1:])
         if getattr(a, "sky", 0.0) > 0:
             # 3D occlusion: the share of a ring of sky directions each point sees past every sphere
             # (the shadow tracer, soft), weighted by how much the surface faces each; a crevice
@@ -1269,6 +1314,12 @@ def main():
     ap.add_argument("--prior-around", type=int, default=64, help="wrapped-still prior texture, around")
     ap.add_argument("--prior-along", type=int, default=144, help="wrapped-still prior texture, along")
     ap.add_argument("--disp-amp", type=float, default=0.0, help="learned radial displacement in tube coordinates, px (tanh cap); 0 = off")
+    ap.add_argument("--bump-amp", type=float, default=0.0, help="fine relief on the texture's grid, px (tanh cap); 0 = off")
+    ap.add_argument("--bump-around", type=int, default=64)
+    ap.add_argument("--bump-along", type=int, default=144)
+    ap.add_argument("--cavity", type=float, default=0.0, help="pits in the fine relief darken by exp(-this * depth px)")
+    ap.add_argument("--cav-r", type=int, default=3, help="cavity: surroundings radius, relief texels")
+    ap.add_argument("--bump-rim", type=float, default=0.0, help="the relief's displacement fades out toward the outline below this facing (0: none)")
     ap.add_argument("--disp-around", type=int, default=8)
     ap.add_argument("--disp-along", type=int, default=12)
     ap.add_argument("--lr-disp", type=float, default=0.03)
