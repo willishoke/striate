@@ -820,6 +820,61 @@ def tex_sample(tex, k, tu, tv):
     return (1 - fx) * ((1 - fy) * g(x0, y0) + fy * g(x0, y0 + 1)) + fx * ((1 - fy) * g(x1, y0) + fy * g(x1, y0 + 1))
 
 
+def rip_build(tex, lmax=4):
+    """A rip-map of tex (K, C, Ha, Wl): every pair of halvings around (i) and along (j) up to lmax,
+    flattened into one buffer. A body seen edge-on is squeezed around but not along, so the two
+    directions are filtered separately."""
+    K, Cn, Ha, Wl = tex.shape
+    la = min(lmax, int(math.log2(Ha & -Ha)))
+    ll = min(lmax, int(math.log2(Wl & -Wl)))
+    rows, flat, off, n = [tex], [], [], 0
+    for i in range(1, la + 1):
+        rows.append(F.avg_pool2d(rows[-1], (2, 1)))
+    for i in range(la + 1):
+        x = rows[i]
+        for j in range(ll + 1):
+            if j:
+                x = F.avg_pool2d(x, (1, 2))
+            flat.append(x.permute(0, 2, 3, 1).reshape(-1, Cn))
+            off.append(n)
+            n += flat[-1].shape[0]
+    return dict(flat=torch.cat(flat), off=torch.tensor(off, device=tex.device).reshape(la + 1, ll + 1),
+                la=la, ll=ll, Ha=Ha, Wl=Wl, K=K)
+
+
+def rip_sample(rm, k, tu, tv, lu, lv):
+    """Sample a rip-map at continuous levels lu (around) and lv (along), log2 texels per pixel:
+    bilinear within each level, linear between levels. tu in turns (wrapping), tv in [0, 1]."""
+    lu = lu.clamp(0, rm["la"])
+    lv = lv.clamp(0, rm["ll"])
+    i0, j0 = lu.floor().long().clamp(max=max(rm["la"] - 1, 0)), lv.floor().long().clamp(max=max(rm["ll"] - 1, 0))
+    fi, fj = (lu - i0).clamp(0, 1)[..., None], (lv - j0).clamp(0, 1)[..., None]
+    flat, Ha, Wl = rm["flat"], rm["Ha"], rm["Wl"]
+    out = 0
+    for di, wi in ((0, 1 - fi), (1, fi)):
+        i = (i0 + di).clamp(max=rm["la"])
+        Hi = Ha >> i
+        x = (tu * Ha - ((1 << i) - 1) / 2) / (1 << i)
+        x0f = torch.floor(x)
+        fx = (x - x0f)[..., None]
+        x0 = x0f.long() % Hi
+        x1 = (x0 + 1) % Hi
+        for dj, wj in ((0, 1 - fj), (1, fj)):
+            j = (j0 + dj).clamp(max=rm["ll"])
+            Wj = Wl >> j
+            y = ((tv.clamp(0, 1) * (Wl - 1) - ((1 << j) - 1) / 2) / (1 << j)).clamp(0, None)
+            y = torch.minimum(y, (Wj - 1).float())
+            y0 = torch.minimum(torch.floor(y), (Wj - 2).clamp(min=0).float())
+            fy = (y - y0)[..., None]
+            y0 = y0.long()
+            y1 = torch.minimum(y0 + 1, Wj - 1)
+            base = rm["off"][i, j] + k * (Hi * Wj)
+            g = lambda xi, yi: flat[base + xi * Wj + yi]
+            s = (1 - fx) * ((1 - fy) * g(x0, y0) + fy * g(x0, y1)) + fx * ((1 - fy) * g(x1, y0) + fy * g(x1, y1))
+            out = out + wi * wj * s
+    return out
+
+
 def torus_sample(img, x, y):
     """Bilinear sample of img (3, G, G) at (x, y) in canvas periods, wrapping both ways. -> (P, 3)."""
     G = img.shape[-1]
@@ -967,7 +1022,7 @@ class BodyLight(torch.nn.Module):
 S_BLEND = 6.0  # px of arclength over which neighbouring spheres share texture coordinates
 
 
-def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None, bump=None, bshift=None, brim=0.0):
+def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None, bump=None, bshift=None, brim=0.0, mip=None):
     """Per pixel-body pair (B, P, 8): front depth w, coverage, normal (3), arclength along the spine,
     and the two around-the-tube components of the hit, each blended over the body's spheres.
     disp (K, Ga, Gl) px: a radial displacement in tube coordinates (around x along). A first pass
@@ -989,7 +1044,13 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     Bk, Nk, Tk = Bv[:, obj], Nv[:, obj], T[:, obj]
     w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)  # front hit, toward the viewer
     g = q + w[..., None] * e  # hit minus centre, world
-    dth = dsl = None
+    dth = dsl = fa = fl = None
+    if mip is not None:  # the pixel's footprint on the surface: turns around and arclength along, per output pixel
+        gp0 = g - (g * Tk).sum(-1, keepdim=True) * Tk
+        rr = gp0.norm(dim=-1).clamp(min=0.5)
+        eth0 = torch.cross(Tk, gp0 / rr[..., None], dim=-1)
+        fa = mip["px"] / (rr * torch.sqrt((1 - (eth0 * e).sum(-1) ** 2).clamp(min=0.0025))) / (2 * math.pi)
+        fl = mip["px"] / torch.sqrt((1 - (Tk * e).sum(-1) ** 2).clamp(min=0.0025))
     if disp is not None or bump is not None:
         th = torch.atan2((g * Nk).sum(-1), (g * Bk).sum(-1))
         tv = ((s - s_lo[:, None]) / s_len[:, None])[obj][None].expand_as(th)
@@ -1011,12 +1072,20 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
             if bshift is not None:
                 bu, bv = (tu + bshift[obj, 0][None, :, None]) % 1.0, bv + bshift[obj, 1][None, :, None]
             hu, hl = 0.5 / Gb, 0.5 / (Lb - 1)
-            bl = tex_sample(bk, kk, bu, bv)[..., 0]
+            if mip is not None:  # filtered to the pixel's footprint, and differenced at the filtered texel's size
+                brm = mip["brm"]
+                lu = (torch.log2(fa * Gb) + mip["bias"]).clamp(0, brm["la"])
+                lv = (torch.log2(fl / slen * (Lb - 1)) + mip["bias"]).clamp(0, brm["ll"])
+                smp = lambda u_, v_: rip_sample(brm, kk, u_, v_, lu, lv)[..., 0]
+                hu, hl = hu * torch.exp2(lu), hl * torch.exp2(lv)
+            else:
+                smp = lambda u_, v_: tex_sample(bk, kk, u_, v_)[..., 0]
+            bl = smp(bu, bv)
             if brim > 0:
                 bl = bl * (((g * e).sum(-1) / rk).clamp(min=0) / brim).clamp(max=1)
             dl = dl + bl
-            dth = dth + (tex_sample(bk, kk, (bu + hu) % 1.0, bv)[..., 0] - tex_sample(bk, kk, (bu - hu) % 1.0, bv)[..., 0]) / (2 * hu * 2 * math.pi)
-            dsl = (tex_sample(bk, kk, bu, bv + hl)[..., 0] - tex_sample(bk, kk, bu, bv - hl)[..., 0]) / (2 * hl * slen)
+            dth = dth + (smp((bu + hu) % 1.0, bv) - smp((bu - hu) % 1.0, bv)) / (2 * hu * 2 * math.pi)
+            dsl = (smp(bu, bv + hl) - smp(bu, bv - hl)) / (2 * hl * slen)
         rk = (rk + dl).clamp(min=0.5)
         w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)
         g = q + w[..., None] * e
@@ -1054,7 +1123,10 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     sl = (lt * (sk + (g * Tk).sum(-1))).sum(-1)
     ca = (lt * (g * Bk).sum(-1)).sum(-1)
     sa = (lt * (g * Nk).sum(-1)).sum(-1)
-    return torch.cat([wk[..., None], ck[..., None], nk, sl[..., None], ca[..., None], sa[..., None]], -1)
+    out = [wk[..., None], ck[..., None], nk, sl[..., None], ca[..., None], sa[..., None]]
+    if mip is not None:  # the footprint, blended like the texture coordinates
+        out += [(lt * fa).sum(-1)[..., None], (lt * fl).sum(-1)[..., None]]
+    return torch.cat(out, -1)
 
 
 def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex", off=(0.0, 0.0), aux=False, lab=None, tex=None, blight=None, sub=None):
@@ -1077,7 +1149,13 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     zh = torch.tensor([0.0, 0.0, 1.0], device=dev)
     Bv = sph["Bv"]  # per sphere: across the tube (transported "up"), and the side direction
     Nv = torch.cross(T, Bv, dim=-1)
-    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"], sph.get("bump"), sph.get("tex_shift"), getattr(a, "bump_rim", 0.0))
+    mip = None
+    if getattr(a, "mip", 0):  # filter the textures to each pixel's footprint (rip-maps), so an edge-on surface
+        # shows its average instead of one texel in many, and trains as a whole instead of a sparse speckle
+        mip = dict(px=1.0 / zm, bias=getattr(a, "mip_bias", 0.0))
+        if sph.get("bump") is not None:
+            mip["brm"] = rip_build(sph["bump"][:, None])
+    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"], sph.get("bump"), sph.get("tex_shift"), getattr(a, "bump_rim", 0.0), mip)
     outs = []
     for i in range(0, pix.shape[0], a.chunk):
         sl_ = slice(i, i + a.chunk)
@@ -1089,6 +1167,9 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     wk, ck, nk, sl, ca, sa = hb[..., 0], hb[..., 1], hb[..., 2:5], hb[..., 5], hb[..., 6], hb[..., 7]
     tu = torch.atan2(sa, ca) / (2 * math.pi) % 1.0
     tv = (sl - sph["s_lo"][obj]) / sph["s_len"][obj]
+    if mip is not None:
+        fa_, fl_ = hb[..., 8], hb[..., 9] / sph["s_len"][obj]  # turns and texture lengths per pixel
+        lev = lambda Ha_, Wl_: ((torch.log2(fa_ * Ha_) + mip["bias"]), (torch.log2(fl_ * (Wl_ - 1)) + mip["bias"]))
     if clay is None:
         kb = obj[None].expand(B, -1)
         tus, tvs = tu, tv
@@ -1097,7 +1178,11 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
             tus, tvs = (tu + sh_[obj, 0]) % 1.0, tv + sh_[obj, 1]
         lgt = tex_sample(tb.tex if tex is None else tex, kb, tus, tvs)
         if hasattr(tb, "tex0"):  # wrapped-still prior + learned residual
-            lgt = lgt + tex_sample(tb.tex0 if sub is None else tb.tex0[sub], kb, tus, tvs)
+            t0_ = tb.tex0 if sub is None else tb.tex0[sub]
+            if mip is not None:
+                lgt = lgt + rip_sample(rip_build(t0_), kb, tus, tvs, *lev(*t0_.shape[2:]))
+            else:
+                lgt = lgt + tex_sample(t0_, kb, tus, tvs)
         alb = torch.sigmoid(lgt)  # (B, P, 3)
         if "hue" in sph:  # per body, radians: turn the colour about the grey axis (YIQ), keeping its luminance
             hh = sph["hue"][obj]
@@ -1119,7 +1204,10 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         cu, cv = tu, tv
         if "tex_shift" in sph:
             cu, cv = (tu + sph["tex_shift"][obj, 0]) % 1.0, tv + sph["tex_shift"][obj, 1]
-        cav = tex_sample(torch.relu(bb - bm)[:, None], obj[None].expand(B, -1), cu, cv)[..., 0]  # (B, P)
+        if mip is not None:
+            cav = rip_sample(rip_build(torch.relu(bb - bm)[:, None]), obj[None].expand(B, -1), cu, cv, *lev(*bm.shape[1:]))[..., 0]
+        else:
+            cav = tex_sample(torch.relu(bb - bm)[:, None], obj[None].expand(B, -1), cu, cv)[..., 0]  # (B, P)
     # ground: the plane z = 0 seen through every pixel
     yy, xx = torch.meshgrid((torch.arange(H, device=dev).float() - H / 2 + off[0]) / zm, (torch.arange(W, device=dev).float() - W / 2 + off[1]) / zm, indexing="ij")
     uu, vv = xx.reshape(-1), yy.reshape(-1)
@@ -1230,6 +1318,8 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     if not aux:
         return img
     out = dict(img=img, ep=ep, den=den, pix=pix, obj=obj, alb=alb, nk=nk, ck=ck, tu=tu, tv=tv, gown=1 - cover, wc=wc)
+    if mip is not None:  # the footprint: turns around and texture lengths along, per output pixel
+        out["fpa"], out["fpl"] = fa_, fl_
     if lab is not None:
         hit = (obj == lab[pix]).float()
         own = torch.zeros(B, H * W, device=dev).index_add_(1, pix, ep * hit[None]) / den
@@ -1356,6 +1446,8 @@ def main():
     ap.add_argument("--sig", type=float, default=0.5, help="silhouette softness, px")
     ap.add_argument("--tau-s", type=float, default=1.0, help="blend between the spheres of a body, px of depth")
     ap.add_argument("--tau-z", type=float, default=0.75, help="soft z-buffer between bodies, px of depth")
+    ap.add_argument("--mip", type=int, default=0, help="filter textures and relief to each pixel's footprint (rip-maps)")
+    ap.add_argument("--mip-bias", type=float, default=0.0, help="--mip: log2 offset of the filter level (negative: sharper)")
     ap.add_argument("--zbuf", default="cover", choices=["cover", "key"], help="z-buffer: covering surfaces compete on depth (cover), or the old coverage-penalised depth (key)")
     ap.add_argument("--chunk", type=int, default=150000, help="pixel-body pairs per checkpointed chunk")
     ap.add_argument("--pen0", type=float, default=0.6)
