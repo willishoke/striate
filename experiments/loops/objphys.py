@@ -196,8 +196,10 @@ class Pile:
         G = torch.einsum("kcij,kcwj->kcwi", Rm, Q - qc) + pc
         pull = torch.zeros_like(p).index_add_(1, self.idx.reshape(-1), (G - P).reshape(K, -1, 3)) / self.cnt[None, :, None]
         Fr = a.k_shape * pull + a.k_anchor * (q - p)
-        # contacts
-        pf, vf, rf = p.reshape(-1, 3), v.reshape(-1, 3), rq.reshape(-1)
+        # contacts: by the driven radius, or (--contact-drawn) by the radius drawn, so a body thickened by
+        # a squeeze pushes back instead of passing into its neighbour
+        rc = r if getattr(a, "contact_drawn", 0) else rq
+        pf, vf, rf = p.reshape(-1, 3), v.reshape(-1, 3), rc.reshape(-1)
         ff = self.f[:, None].expand(K, N).reshape(-1)
         d = self.wrap(pf[self.pj] - pf[self.pi])
         dist = d.norm(dim=-1).clamp(min=1e-6)
@@ -215,7 +217,7 @@ class Pile:
         Fc = torch.zeros_like(pf).index_add_(0, self.pi, -fm[:, None] * n).index_add_(0, self.pj, fm[:, None] * n)
         Fc = Fc.reshape(K, N, 3) / self.mass[:, None, None]
         # ground: a sphere's bottom stays above where it was at rest (or 0)
-        zb = p[..., 2] - self.f[:, None] * rq
+        zb = p[..., 2] - self.f[:, None] * rc
         Fg = torch.zeros_like(p)
         Fg[..., 2] = a.k_contact * torch.relu(self.zfloor - zb)
         if a.pokers:
@@ -340,6 +342,7 @@ def main():
     ap.add_argument("--k-shape", type=float, default=0.25, help="per frame^2: wobble period 2 pi / sqrt(k) frames")
     ap.add_argument("--k-anchor", type=float, default=0.08)
     ap.add_argument("--k-contact", type=float, default=0.2)
+    ap.add_argument("--contact-drawn", type=int, default=0, help="contacts by the radius drawn (thickened where squeezed), not the driven one")
     ap.add_argument("--c-contact", type=float, default=0.3)
     ap.add_argument("--zeta", type=float, default=0.12, help="damping ratio of the shape mode")
     ap.add_argument("--nu", type=float, default=0.5, help="radius ~ stretch^-nu")
@@ -385,6 +388,13 @@ def main():
     ap.add_argument("--train-light", type=float, default=0.0, help="training: each sample's key light turns up to this many degrees in azimuth and drops up to half of it in elevation, so shading painted for one light fails the rest")
     ap.add_argument("--light-swing", type=float, default=0.0, help="render: the key light swings this many degrees in azimuth (and a quarter of it in elevation) over the loop")
     ap.add_argument("--bump-rim", type=float, default=None, help="relief displacement fades toward the outline (default: the checkpoint's)")
+    ap.add_argument("--mip", type=int, default=None, help="filter textures and relief to each pixel's footprint (objtube.py --mip; default: the checkpoint's)")
+    ap.add_argument("--mip-bias", type=float, default=0.0)
+    ap.add_argument("--wskin", type=float, default=0.0, help="training: the skin a camera never saw sharply (finer than --skin-fp) "
+                    "must match the pattern statistics (Gram matrices of --skin-layers) of the skin it did, body by body")
+    ap.add_argument("--skin-fp", type=float, default=2.0, help="--wskin: seen sharply = at most this many texels per still pixel at rest")
+    ap.add_argument("--skin-layers", default="conv3,inception3a")
+    ap.add_argument("--skin-bodies", type=int, default=24, help="--wskin: bodies per step")
     ap.add_argument("--lr-bump", type=float, default=0.0, help="training: the fine relief's rate")
     ap.add_argument("--whf", type=float, default=0.0, help="training: penalty on the paint's fine luminance detail (relative to its start), so the detail moves into the relief")
     ap.add_argument("--hf-r", type=int, default=3, help="--whf: fine = finer than this many texels")
@@ -415,6 +425,9 @@ def main():
     if a.bump_rim is not None:
         ta.bump_rim = a.bump_rim
         ck["args"] = {**ck["args"], "bump_rim": a.bump_rim}
+    if a.mip is not None:
+        ta.mip, ta.mip_bias = a.mip, a.mip_bias
+        ck["args"] = {**ck["args"], "mip": a.mip, "mip_bias": a.mip_bias}
     if a.cavity is not None:
         ta.cavity, ta.cav_r = a.cavity, a.cav_r
         ck["args"] = {**ck["args"], "cavity": a.cavity, "cav_r": a.cav_r}
@@ -557,6 +570,57 @@ def main():
             return (Y_ - F.avg_pool2d(Yp, 2 * r_ + 1, stride=1)).pow(2).mean()
 
         hf0 = float(paint_hf()) if a.whf > 0 else 1.0
+
+        def wrap_pad(x, p):  # around wraps, along repeats its ends
+            return F.pad(torch.cat([x[:, :, -p:], x, x[:, :, :p]], 2), (p, p, 0, 0), mode="replicate")
+
+        if a.wskin > 0:
+            # which texels the rest pose shows sharply: footprints from a 2x render, the finest per texel
+            ta2 = argparse.Namespace(**vars(ta))
+            ta2.mip = 1
+            Z2 = 2 * S
+            cam2 = Cam(np.eye(3), Z2, Z2, (S / 2, S / 2, 0.0), S, zoom=2.0)
+            Kt, _, Ha, Wl = tb.tex0.shape
+            with torch.no_grad():
+                sp_ = tb.spheres()
+                o = render(tb, sp_, cam2, build_pairs(sp_, cam2, 4.0), [rig()], ta2, aux=True)
+                pix_, obj_ = o["pix"], o["obj"]
+                share = o["ep"][0] / o["den"][0][pix_]
+                top_ = torch.zeros(Z2 * Z2, device=dev).scatter_reduce(0, pix_, share, "amax", include_self=True)
+                dom = (share >= top_[pix_] - 1e-9) & (share > 0.3)
+                fp_ = torch.maximum(o["fpa"][0] * Ha, o["fpl"][0] * (Wl - 1)) * 2.0  # texels per still pixel
+                idx = (obj_ * Ha + (o["tu"][0] * Ha).long() % Ha) * Wl + (o["tv"][0].clamp(0, 1) * (Wl - 1)).round().long()
+                best = torch.full((Kt * Ha * Wl,), 1e3, device=dev).scatter_reduce(0, idx[dom], fp_[dom], "amin", include_self=True)
+                good = (best.reshape(Kt, 1, Ha, Wl) <= a.skin_fp).float()
+                good = (F.avg_pool2d(wrap_pad(good, 1), 3, stride=1) > 0.4).float()
+                del o
+            gfrac = good.mean((1, 2, 3))
+            skin_ok = ((gfrac > 0.05) & (gfrac < 0.95)).nonzero()[:, 0].tolist()
+            log(f"skin: {float(good.mean()):.1%} of texels seen sharply at rest; {len(skin_ok)} bodies take the skin term")
+            pk = list(range(0, Kt, max(1, Kt // 8)))[:8]
+            save(torch.cat([F.pad(good[k], (0, 4, 0, 4), value=0.5).expand(3, -1, -1) for k in pk], 2), f"{a.out}/skin_good.png")
+            snet = Backbone(ta.net, dev)
+            for L_ in a.skin_layers.split(","):
+                snet.hook(L_)
+            skin_rng = random.Random(a.seed + 11)
+
+            def skin_loss():
+                sel = torch.tensor(skin_rng.sample(skin_ok, min(a.skin_bodies, len(skin_ok))), device=dev)
+                t0_, tx_ = tb.tex0[sel], tb.tex[sel]
+                k_ = Ha // tx_.shape[2]
+                up = F.interpolate(torch.cat([tx_[:, :, -1:], tx_, tx_[:, :, :1]], 2), size=(Ha + 2 * k_, Wl), mode="bilinear", align_corners=False)
+                alb_ = wrap_pad(torch.sigmoid(t0_ + up[:, :, k_:k_ + Ha]), 16)
+                m_ = wrap_pad(good[sel], 16)
+                tot = 0
+                for L_, f_ in snet(alb_).items():
+                    mm = F.adaptive_avg_pool2d(m_, f_.shape[-2:])[:, 0]
+                    f_ = f_ / (f_.detach().pow(2).mean((0, 2, 3), keepdim=True).sqrt() + 1e-6)
+                    gram = lambda w_: torch.einsum("kchw,kdhw,khw->kcd", f_, f_, w_) / w_.sum((1, 2))[:, None, None].clamp(min=1e-3)
+                    mean = lambda w_: torch.einsum("kchw,khw->kc", f_, w_) / w_.sum((1, 2))[:, None].clamp(min=1e-3)
+                    Gg, Gb = gram(mm).detach(), gram(1 - mm)
+                    Mg, Mb = mean(mm).detach(), mean(1 - mm)
+                    tot = tot + ((Gb - Gg) ** 2).sum((1, 2)).div((Gg ** 2).sum((1, 2))).mean() + ((Mb - Mg) ** 2).sum(1).div((Mg ** 2).sum(1)).mean()
+                return tot
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
@@ -606,11 +670,14 @@ def main():
             pen = torch.stack(pens).mean()
             if a.whf > 0:
                 pen = pen + a.whf * paint_hf() / hf0
+            if a.wskin > 0:
+                sk = skin_loss()
+                pen = pen + a.wskin * sk
             opt.zero_grad()
             (-act + act.detach().abs() * pen).backward()
             opt.step()
             if it % 25 == 0 or it == a.train - 1:
-                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f} (frames {ts})")
+                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + f" (frames {ts})")
                 if str(dev).startswith("mps"):
                     torch.mps.empty_cache()
             if (it + 1) % 100 == 0 and it + 1 < a.train:  # a crash late in a run keeps most of it
