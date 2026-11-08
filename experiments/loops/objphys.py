@@ -520,6 +520,10 @@ def main():
     ap.add_argument("--hf-r", type=int, default=3, help="--whf: fine = finer than this many texels")
     ap.add_argument("--grow", default=None, help="textures grown by a lipgrow.py rule (its .pt): with --train, the rule trains instead of the paint")
     ap.add_argument("--lr-grow", type=float, default=1e-3, help="training: the growth rule's rate")
+    ap.add_argument("--skin-prior", default=None, help="skins decoded from a skinprior.py VAE (its model.pt), trained on the still's sharp tops: "
+                    "with --train, each body's latents train instead of its paint (tex0; tex is zeroed) and relief (bump)")
+    ap.add_argument("--lr-skin", type=float, default=0.01, help="--skin-prior: the latents' rate")
+    ap.add_argument("--wkl", type=float, default=0.1, help="--skin-prior: weight of the latents' prior term (0.5 z^2 per element), so they stay on the manifold")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     t0 = time.time()
@@ -702,6 +706,23 @@ def main():
         with torch.no_grad():
             tb.tex.zero_()
             tb.tex0 = grower(size=tsz)
+    skp = None
+    if a.skin_prior:  # every body's skin (paint and relief) decoded from its own latents, encoded from its current skin
+        from skinprior import SkinPrior
+        assert hasattr(tb, "bump"), "--skin-prior decodes the relief too"
+        skp = SkinPrior(a.skin_prior, dev)
+        with torch.no_grad():
+            Kt, _, Ha, Wl = tb.tex0.shape
+            k_ = Ha // tb.tex.shape[2]
+            up = F.interpolate(torch.cat([tb.tex[:, :, -1:], tb.tex, tb.tex[:, :, :1]], 2), size=(Ha + 2 * k_, Wl), mode="bilinear", align_corners=False)
+            skp.init(tb.tex0 + up[:, :, k_:k_ + Ha], tb.bump, tb.spheres())
+            t0d, bd = skp.decode()
+            tb.tex.zero_()
+            del tb.tex0
+            tb.tex0 = torch.nn.Parameter(t0d)  # not trained itself: it holds each step's decode, and collects its gradient
+            tb.bump.copy_(bd)
+        log(f"skins decoded from {a.skin_prior}: {sum(z_.numel() for z_ in skp.z) / 1e6:.2f}M latents over {sum(h * w for h, w, _, _ in skp.ch) / 1e6:.1f}M canvas texels "
+            f"({skp.delta} px each); prior term {float(skp.kl()):.3f}")
     if a.tex_from:  # textures (and the ground) for the first bodies from another checkpoint, e.g. one trained under a loop
         st = torch.load(a.tex_from, map_location="cpu", weights_only=False)["tubes"]
         with torch.no_grad():
@@ -784,7 +805,9 @@ def main():
 
     if a.train:
         groups = [{"params": [tb.tex], "lr": a.lr_tex}, {"params": [tb.ground], "lr": a.lr_ground}]
-        if grower is not None:
+        if skp is not None:  # the latents train; paint and relief are their decodes
+            groups = [{"params": list(skp.z), "lr": a.lr_skin}, {"params": [tb.ground], "lr": a.lr_ground}]
+        elif grower is not None:
             groups = [{"params": list(grower.parameters()), "lr": a.lr_grow}, {"params": [tb.ground], "lr": a.lr_ground}]
         elif a.lr_prior > 0 and hasattr(tb, "tex0"):
             # the wrapped-still prior (64 x 144) carries the fine texture, and the streaks the hidden
@@ -793,7 +816,7 @@ def main():
             del tb.tex0
             tb.tex0 = torch.nn.Parameter(t0_)
             groups.append({"params": [tb.tex0], "lr": a.lr_prior})
-        if a.lr_bump > 0 and hasattr(tb, "bump"):
+        if a.lr_bump > 0 and hasattr(tb, "bump") and skp is None:
             groups.append({"params": [tb.bump], "lr": a.lr_bump})
         if hasattr(tb, "capt"):  # the caps' discs learn as the paint (and relief) they continue
             groups.append({"params": [tb.capt], "lr": a.lr_prior if a.lr_prior > 0 else a.lr_tex})
@@ -940,11 +963,17 @@ def main():
                 tb.tex0 = grower(size=tsz)
             acts, pens = [], []
             opt.zero_grad()
+            if skp is not None:  # this step's skins, decoded without a graph: their gradients reach the latents after the frames
+                with torch.no_grad():
+                    t0d, bd = skp.decode()
+                    tb.tex0.copy_(t0d)
+                    tb.bump.copy_(bd)
+                tb.tex0.grad, tb.bump.grad = None, None
 
             def relief():  # the frames' spheres were built without gradient; the relief maps are the
                 # parameters' own, rebuilt with it (until 2026-11-07 they were not, and --lr-bump trained nothing)
                 out = {}
-                if hasattr(tb, "bump") and a.lr_bump > 0:
+                if hasattr(tb, "bump") and (a.lr_bump > 0 or skp is not None):
                     out["bump"] = ta.bump_amp * torch.tanh(tb.bump)
                 if hasattr(tb, "capb") and a.lr_bump > 0:
                     out["capb"] = ta.bump_amp * torch.tanh(tb.capb)
@@ -1005,12 +1034,17 @@ def main():
             if a.wskin > 0:
                 sk = skin_loss()
                 extra = extra + a.wskin * sk
+            if skp is not None:
+                kl_ = skp.kl()
+                extra = extra + a.wkl * kl_
             if torch.is_tensor(extra):
                 (act.abs() * extra).backward()
                 pen = pen + extra.detach()
+            if skp is not None:
+                skp.backward(tb.tex0.grad, tb.bump.grad)
             opt.step()
             if it % 25 == 0 or it == a.train - 1:
-                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + f" (frames {ts})")
+                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + (f" kl {float(kl_):.3f}" if skp is not None else "") + f" (frames {ts})")
                 if str(dev).startswith("mps"):
                     torch.mps.empty_cache()
             if (it + 1) % 100 == 0 and it + 1 < a.train:  # a crash late in a run keeps most of it
@@ -1019,9 +1053,16 @@ def main():
             torch.save(dict(cfg=grower.cfg, state={k: v.detach().cpu() for k, v in grower.state_dict().items()}), f"{a.out}/grow.pt")
             with torch.no_grad():
                 tb.tex0 = grower(size=tsz)
+        if skp is not None:  # the final latents' skins
+            with torch.no_grad():
+                t0d, bd = skp.decode()
+                tb.tex0.copy_(t0d)
+                tb.bump.copy_(bd)
         ck2 = dict(ck)
         ck2["tubes"] = {**ck["tubes"], **{k: v.detach().cpu() for k, v in tb.state_dict().items()}}
         ck2["phys_train"] = vars(a)
+        if skp is not None:
+            ck2["skin_prior"] = dict(model=a.skin_prior, **skp.state())
         torch.save(ck2, f"{a.out}/tube.pt")
         log(f"saved {a.out}/tube.pt")
 
