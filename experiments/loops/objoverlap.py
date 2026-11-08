@@ -12,10 +12,19 @@ from objtube import Mixed
 from objphys import Pile
 tj = torch.load(src, weights_only=False)
 a = argparse.Namespace(**tj["args"])
+def parse(v):
+    for t in (int, float):
+        try:
+            return t(v)
+        except ValueError:
+            pass
+    return v
+
+
 for kv in sys.argv[2:]:
     k, v = kv.split("=")
     old = getattr(a, k, None)
-    setattr(a, k, type(old)(v) if old is not None else float(v))
+    setattr(a, k, type(old)(v) if old is not None else parse(v))
 ck = torch.load(a.load, map_location="cpu", weights_only=False)
 ta = argparse.Namespace(**ck["args"])
 tb0 = Mixed.from_state(ck["tubes"], ta, torch.device("cpu"))
@@ -40,9 +49,8 @@ for t in range(traj.shape[0]):
     _, rq = pile.rest(float(t))
     rq = rq.reshape(-1)
     ff = pile.f[:, None].expand(K, N).reshape(-1)
-    d = pile.wrap(p[pile.pj] - p[pile.pi]); dist = d.norm(dim=-1).clamp(min=1e-6); n = d / dist[:, None]
-    e = (pile.support(r[pile.pi], ff[pile.pi], n) + pile.support(r[pile.pj], ff[pile.pj], n) - dist - pile.pen0).clamp(min=0)
-    eq = (pile.support(rq[pile.pi], ff[pile.pi], n) + pile.support(rq[pile.pj], ff[pile.pj], n) - dist - pile.pen0).clamp(min=0)
+    e = (pile.overlap(p, r, ff, pile.pi, pile.pj)[0] - pile.pen0).clamp(min=0)
+    eq = (pile.overlap(p, rq, ff, pile.pi, pile.pj)[0] - pile.pen0).clamp(min=0)
     ex.append(e); exq.append(eq)
 ex, exq = torch.stack(ex), torch.stack(exq)
 res = dict(drawn=dict(rms=float(ex.pow(2).mean().sqrt()), p99=float(ex.flatten().quantile(0.99)), p999=float(ex.flatten().quantile(0.999)), max=float(ex.max()),

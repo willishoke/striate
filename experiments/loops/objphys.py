@@ -28,19 +28,29 @@ not a crossfade.
              pen^1.5), so the interpenetration the still relies on stays, and a swelling body shoves
              its neighbours. --prestress shrinks that allowance by a fraction of the radii: the pile
              is packed under pressure, neighbours follow, gaps close. The ground pushes up likewise.
+             --hard 1: after every substep the contacts are also projected (position-based, Jacobi):
+             no pair is left overlapping more than at rest, so a body flattens against its neighbour
+             or shoves it, but never passes into it. The rest overlap is the wall two pressed bodies
+             share (invisible: it is inside the union). --contact-metric scaled measures a pair in z
+             divided by its squash, where both are spheres: the support-radius measure swings with the
+             line of centres, and deep rest overlaps then pop.
   volume     a sphere's radius scales with the local stretch of the spine as stretch^-nu (--nu 0.5 is
              incompressible): squash and stretch. Drawn only: contact uses the driven radius, since
              thickening where the spine is squeezed presses harder and squeezes it more (a runaway).
   effects    at render time, all closed over the loop: --hue-walk (each body's colour turns about the
              grey axis), --tex-turn / --tex-slide (each body's texture turns about its spine and slides
-             along it), --funhouse (a smooth 3D warp of the whole pile; the light follows it).
+             along it), --funhouse (a smooth 3D warp of the whole pile; the light follows it; with
+             --fh-sim 1 it is part of the drive instead, so the contacts see it).
   loop       semi-implicit Euler, --substeps per frame, damping --zeta of the shape mode. The drive is
              periodic, so after --warm periods the motion settles onto a cycle; one period is recorded
              and its closure error reported (and the remainder removed by a linear ramp in position).
 
 Then the recorded period is rendered under the checkpoint's learned light (lit, and clay), scored per
 frame with the 4 fixed crops, and its visible ground (gaps) measured. --train N retrains the texture
-under random frames of the loop (positions fixed, grads only into textures and ground).
+under random frames of the loop (positions fixed, grads only into textures and ground). --train-sym p
+shows each body, with probability p per frame, rolled about its spine, mirrored and/or reversed end for
+end, so every side of its skin is judged as its top is; --caps disc converts a checkpoint's end caps
+(objtube.py) first.
 
 usage: objphys.py --load tube.pt --image still.png --target inception4c:7 --out DIR [--render] [--train N]
        Simulation runs on the CPU (no GPU lock needed with --sim-only); rendering and training need MPS.
@@ -56,7 +66,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z, with_dir
+from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z, with_dir, tex_span, convert_caps, roll_tile, spec_fill, patch_fill, carry
 
 
 # ---------------------------------------------------------------- physics (CPU, float64)
@@ -113,12 +123,35 @@ class Pile:
         self.cnt = torch.zeros(N, dtype=dd).index_add_(0, self.idx.reshape(-1), torch.ones(self.idx.numel(), dtype=dd))
         # contact pairs: spheres of different bodies close at rest (anything that could meet)
         self.pi, self.pj, self.pen0 = self.contact_pairs(log)
+        self.fh = None
+        if getattr(a, "fh_sim", 0) and a.funhouse:  # the funhouse warp as part of the drive: contacts see it
+            self.fh = funhouse_waves(a, torch.Generator().manual_seed(a.seed + 202))
 
     def wrap(self, d):
         return torch.cat([d[..., :2] - self.S * torch.round(d[..., :2] / self.S), d[..., 2:]], -1)
 
     def support(self, r, f, n):
         return r * torch.sqrt(n[..., 0] ** 2 + n[..., 1] ** 2 + (f * n[..., 2]) ** 2)
+
+    def overlap(self, pf, rf, ff, I, J):
+        """Overlap (px) of sphere pairs I, J (before subtracting rest) and the world direction (unit, from I
+        to J) that relieves it. --contact-metric support: radii along the line of centres (squashed
+        spheres' support); it swings by (1 - f) r when that line turns from level to vertical, so a pair
+        overlapping deeply at rest can pop. scaled: z divided by the pair's mean squash, where both are
+        spheres (exact for equal squash), so the overlap is smooth in the positions."""
+        d = self.wrap(pf[J] - pf[I])
+        if getattr(self.a, "contact_metric", "support") == "scaled":
+            fz = 0.5 * (ff[I] + ff[J])
+            ds = torch.cat([d[:, :2], d[:, 2:] / fz[:, None]], -1)
+            dist = ds.norm(dim=-1).clamp(min=1e-6)
+            ns = ds / dist[:, None]
+            g = torch.cat([ns[:, :2], ns[:, 2:] / fz[:, None]], -1)  # gradient of the scaled distance
+            gn = g.norm(dim=-1, keepdim=True)
+            # moving dp along g/|g| changes the scaled distance by |g| dp: corrections divide by it
+            return rf[I] + rf[J] - dist, g / gn, gn[:, 0]
+        dist = d.norm(dim=-1).clamp(min=1e-6)
+        n = d / dist[:, None]
+        return self.support(rf[I], ff[I], n) + self.support(rf[J], ff[J], n) - dist, n, torch.ones_like(dist)
 
     def contact_pairs(self, log):
         a, K, N = self.a, self.K, self.N
@@ -139,10 +172,7 @@ class Pile:
             x, y = torch.nonzero(ok, as_tuple=True)
             I.append(ii[x]); J.append(jj[y])
         I, J = torch.cat(I), torch.cat(J)
-        d = self.wrap(P[J] - P[I])
-        dist = d.norm(dim=-1).clamp(min=1e-6)
-        n = d / dist[:, None]
-        pen = self.support(R[I], F_[I], n) + self.support(R[J], F_[J], n) - dist
+        pen = self.overlap(P, R, F_, I, J)[0]
         allow = pen.clamp(min=0) - a.prestress * (R[I] + R[J])
         log(f"contact pairs: {len(I)} between {len(bi)} body pairs; overlapping at rest {(pen > 0).float().mean():.2f}, "
             f"median overlap {pen[pen > 0].median():.2f}px")
@@ -167,7 +197,40 @@ class Pile:
         if self.a.bend > 0:
             w = torch.sin(math.pi * self.a.bend_waves * self.u - 2 * math.pi * self.a.cycles * t / self.T + self.bph[:, None])
             q = q + self.perp * (self.a.bend * w * self.u.clamp(0.15, 1) * self.moves[:, None])[..., None]
+        if self.fh is not None:
+            q = q + funhouse_disp(self.fh, self.C0, t, self.T, self.S, self.a.funhouse)
         return q, r
+
+    def project(self, p, rc):
+        """Hard contacts: move sphere pairs apart along their normal until no pair overlaps more than it
+        did at rest (Jacobi, each sphere taking the mean of its corrections, split by inverse mass), and
+        lift spheres off the ground. Returns the corrected positions."""
+        a, K, N = self.a, self.K, self.N
+        pf, rf = p.reshape(-1, 3).clone(), rc.reshape(-1)
+        ff = self.f[:, None].expand(K, N).reshape(-1)
+        im = (1 / self.mass)[:, None].expand(K, N).reshape(-1)
+        wi, wj = im[self.pi], im[self.pj]
+        adh = (self.pen0 > a.adhere) if getattr(a, "adhere", 0) > 0 else None
+        for it in range(getattr(a, "hard_iters", 40)):
+            ov, n, gn = self.overlap(pf, rf, ff, self.pi, self.pj)
+            pen = ov - self.pen0
+            on = pen > 0
+            gap = None
+            if adh is not None:  # pairs pressed together at rest may not come apart by more than the slack
+                gap = torch.where(adh, (self.pen0 - a.adhere) - ov, torch.zeros_like(ov)).clamp(min=0)
+                on = on | (gap > 0)
+            worst = float(pen.max()) if gap is None else max(float(pen.max()), float(gap.max()))
+            if not bool(on.any()) or worst < getattr(a, "hard_tol", 0.01):
+                break
+            c = (pen.clamp(min=0) - (gap if gap is not None else 0)) / ((wi + wj) * gn)
+            dp = torch.zeros_like(pf).index_add_(0, self.pi, -(c * wi)[:, None] * n).index_add_(0, self.pj, (c * wj)[:, None] * n)
+            cnt = torch.zeros(len(pf), dtype=pf.dtype).index_add_(0, self.pi, on.to(pf.dtype)).index_add_(0, self.pj, on.to(pf.dtype))
+            pf = pf + getattr(a, "hard_omega", 1.0) * dp / cnt.clamp(min=1)[:, None]
+        self.hard_left = float(pen.clamp(min=0).max())
+        p = pf.reshape(K, N, 3)
+        zb = p[..., 2] - self.f[:, None] * rc
+        lift = torch.relu(self.zfloor - zb)
+        return p + torch.stack([torch.zeros_like(lift), torch.zeros_like(lift), lift], -1)
 
     def radii(self, p, q, rq):
         """Radius under local stretch along the spine: stretch^-nu."""
@@ -201,10 +264,10 @@ class Pile:
         rc = r if getattr(a, "contact_drawn", 0) else rq
         pf, vf, rf = p.reshape(-1, 3), v.reshape(-1, 3), rc.reshape(-1)
         ff = self.f[:, None].expand(K, N).reshape(-1)
-        d = self.wrap(pf[self.pj] - pf[self.pi])
-        dist = d.norm(dim=-1).clamp(min=1e-6)
-        n = d / dist[:, None]
-        pen = self.support(rf[self.pi], ff[self.pi], n) + self.support(rf[self.pj], ff[self.pj], n) - dist - self.pen0
+        pen, n, _ = self.overlap(pf, rf, ff, self.pi, self.pj)
+        pen = pen - self.pen0
+        self._pen_true = pen
+        pen = pen + getattr(a, "cushion", 0.0)  # the springs start this far short of the limit (--hard enforces the limit itself)
         on = pen > 0
         vn = ((vf[self.pj] - vf[self.pi]) * n).sum(-1)
         # the bodies are dense chains of overlapping spheres, so one contact is many sphere pairs: each
@@ -223,7 +286,7 @@ class Pile:
         if a.pokers:
             Fg = Fg + self.poke(p, rq, t)
         omega = math.sqrt(a.k_shape)
-        self.excess = float((pen.clamp(min=0) ** 2).mean().sqrt())
+        self.excess = float((self._pen_true.clamp(min=0) ** 2).mean().sqrt())
         return Fr + Fc + Fg - 2 * a.zeta * omega * v, r, int(on.sum())
 
     def poker_pos(self, t):
@@ -254,7 +317,7 @@ class Pile:
         v = torch.zeros_like(p)
         dt = 1.0 / a.substeps
         T = self.T
-        traj, rads, nc, ex = [], [], [], []
+        traj, rads, nc, ex, hl = [], [], [], [], []
         ends = []
         t0 = time.time()
         for fr in range((a.warm + 1) * T + 1):
@@ -270,9 +333,15 @@ class Pile:
                 break
             for sub in range(a.substeps):
                 t = fr + sub * dt
-                Ft, _, ncon = self.forces(p, v, t)
+                Ft, r_, ncon = self.forces(p, v, t)
                 v = v + dt * Ft
                 p = p + dt * v
+                if getattr(a, "hard", 0):  # position-based: whatever the springs left, no pair passes further in than at rest
+                    rc = r_ if a.contact_drawn else self.rest(t + dt)[1]
+                    pc = self.project(p, rc)
+                    v = v + getattr(a, "hard_vel", 1.0) * (pc - p) / dt  # 1: the correction becomes velocity (standard); less: softer
+                    p = pc
+                    hl.append(self.hard_left)
             nc.append(ncon)
             ex.append(self.excess)
         traj, rads = torch.stack(traj), torch.stack(rads)  # (T + 1, K, N, 3)
@@ -281,16 +350,34 @@ class Pile:
         ramp = torch.linspace(0, 1, T + 1, dtype=traj.dtype)[:, None, None, None]
         traj = (traj - ramp * gap)[:T]  # the leftover of the cycle, spread over the period
         rads = (rads - ramp[..., 0] * (rads[-1] - rads[0]))[:T]
+        if getattr(a, "hard", 0):  # the closing ramp moves things by a hair: project every recorded frame once more
+            traj = torch.stack([self.project(traj[t], rads[t] if a.contact_drawn else self.rest(float(t))[1]) for t in range(T)])
         q0 = torch.stack([self.rest(float(t))[0] for t in range(T)])
         dev_rest = (traj - self.C0[None]).norm(dim=-1)  # displacement from the still's pose
         dev_drive = (traj - q0).norm(dim=-1)  # the part not prescribed by the drive: pushes, lag, wobble
         stats = dict(closure=close, disp_mean=float(dev_rest.mean()), disp_p99=float(dev_rest.flatten().quantile(0.99)),
                      disp_max=float(dev_rest.max()), dyn_mean=float(dev_drive.mean()), dyn_p99=float(dev_drive.flatten().quantile(0.99)),
-                     contacts_mean=float(np.mean(nc[-T:])), excess_rms=float(np.mean(ex[-T:])))
+                     contacts_mean=float(np.mean(nc[-T:])), excess_rms=float(np.mean(ex[-T:])),
+                     hard_left_max=float(np.max(hl[-T * a.substeps:])) if hl else None)
         log(f"closure max {close['max']:.3f}px rms {close['rms']:.4f}px; displacement from rest mean {stats['disp_mean']:.2f} p99 {stats['disp_p99']:.2f} "
             f"max {stats['disp_max']:.2f}px; beyond the drive mean {stats['dyn_mean']:.2f} p99 {stats['dyn_p99']:.2f}px; contacts {stats['contacts_mean']:.0f}, "
             f"overlap past rest rms {stats['excess_rms']:.3f}px")
         return traj.float(), rads.float(), stats
+
+
+def funhouse_waves(a, gen):
+    """Plane waves for --funhouse: k (cycles per canvas), c (cycles per loop), a random direction and phase each."""
+    W_ = torch.tensor([[float(x) for x in w.split(",")] for w in a.fh_waves.split(";")], dtype=torch.float64)
+    dirs = torch.randn(len(W_), 3, generator=gen, dtype=torch.float64) * torch.tensor([1.0, 1.0, 0.4], dtype=torch.float64)
+    dirs = dirs / dirs.norm(dim=-1, keepdim=True)
+    return W_, dirs, torch.rand(len(W_), generator=gen, dtype=torch.float64) * 2 * math.pi
+
+
+def funhouse_disp(fh, P, t, T, S, amp):
+    """(K, N, 3) displacement of points P (K, N, 3) at time t: the whole pile bends together."""
+    Wk, dk, pk = (x.to(P.dtype) for x in fh)
+    arg = 2 * math.pi * ((P[..., 0:1] * Wk[:, 0] + P[..., 1:2] * Wk[:, 1]) / S + Wk[:, 2] * t / T) + pk
+    return amp / math.sqrt(len(Wk) / 2) * (torch.sin(arg)[..., None] * dk).sum(-2)
 
 
 def padded(pr, bucket=1 << 16):
@@ -344,6 +431,16 @@ def main():
     ap.add_argument("--k-contact", type=float, default=0.2)
     ap.add_argument("--contact-drawn", type=int, default=0, help="contacts by the radius drawn (thickened where squeezed), not the driven one")
     ap.add_argument("--c-contact", type=float, default=0.3)
+    ap.add_argument("--hard", type=int, default=0, help="after every substep, project contacts: no pair overlaps past rest (position-based)")
+    ap.add_argument("--hard-iters", type=int, default=40)
+    ap.add_argument("--contact-metric", default="support", choices=["support", "scaled"], help="how a squashed sphere pair's overlap is measured (see Pile.overlap)")
+    ap.add_argument("--hard-tol", type=float, default=0.01, help="px: projection stops once the worst pair is within this")
+    ap.add_argument("--hard-omega", type=float, default=1.0, help="projection relaxation")
+    ap.add_argument("--adhere", type=float, default=0.0, help="--hard: sphere pairs pressed together at rest (by more than this, px) may not "
+                    "come apart by more than this either: walls between pressed bodies hold, so a shrinking body draws its neighbours in instead of opening a gap")
+    ap.add_argument("--cushion", type=float, default=0.0, help="px: contact springs push from this far before the rest overlap is reached, so a meeting is cushioned before --hard stops it")
+    ap.add_argument("--hard-vel", type=float, default=1.0, help="share of a projection's correction kept as velocity (1: position-based dynamics; less: fewer kicks)")
+    ap.add_argument("--fh-sim", type=int, default=0, help="simulate the funhouse warp as part of the drive, so contacts see it (render adds none)")
     ap.add_argument("--zeta", type=float, default=0.12, help="damping ratio of the shape mode")
     ap.add_argument("--nu", type=float, default=0.5, help="radius ~ stretch^-nu")
     ap.add_argument("--prestress", type=float, default=0.0, help="packing pressure: contact allowance cut by this fraction of the radii")
@@ -363,6 +460,13 @@ def main():
     ap.add_argument("--render-after", type=int, default=1, help="training: also render the loop afterwards (0: just save tube.pt)")
     ap.add_argument("--mb", type=int, default=2)
     ap.add_argument("--train-turn", type=float, default=0.0, help="training: turn each body's texture by up to this many turns at random (and slide by half that)")
+    ap.add_argument("--train-sym", type=float, default=0.0, help="training: each body, with this probability per frame, is shown "
+                    "rolled a random amount about its spine and at random mirrored and/or reversed end for end (paint and relief)")
+    ap.add_argument("--view-sphere", type=float, default=0.0, help="training: fraction of frames seen from anywhere on the sphere "
+                    "(below too, floor hidden), the lighting turning with the camera")
+    ap.add_argument("--sphere-cone", type=float, default=45.0, help="--view-sphere: degrees from straight down / straight up")
+    ap.add_argument("--sphere-top", type=float, default=0.5, help="--view-sphere: share of those views from above (the rest from below)")
+    ap.add_argument("--train-rest", type=int, default=0, help="training: on the still's pose, frozen, instead of loop frames")
     ap.add_argument("--view-frac", type=float, default=0.0, help="training: fraction of frames seen through a tilted camera")
     ap.add_argument("--view-tilt", type=float, default=40.0, help="training: tilted camera, 10 to this many degrees off vertical, any azimuth")
     ap.add_argument("--also-trajs", help="training: comma-separated traj.pt files of other loops to train under as well")
@@ -390,6 +494,16 @@ def main():
     ap.add_argument("--bump-rim", type=float, default=None, help="relief displacement fades toward the outline (default: the checkpoint's)")
     ap.add_argument("--mip", type=int, default=None, help="filter textures and relief to each pixel's footprint (objtube.py --mip; default: the checkpoint's)")
     ap.add_argument("--mip-bias", type=float, default=0.0)
+    ap.add_argument("--caps", default=None, choices=["proj", "disc"], help="end caps: proj (the old projected span, a pole where the "
+                    "around coordinate pinches) or disc (geodesic span, and each cap its own disc texture toward the pole); default: the checkpoint's")
+    ap.add_argument("--spec-fill", type=int, default=0, help="iterations: fill each body's unseen skin (paint and relief) from the spectrum of its seen skin")
+    ap.add_argument("--fill", default="patch", choices=["patch", "spec"], help="--spec-fill: by patches of the seen skin (texture optimisation) or by its spectrum (random phases: Gaussian noise, loses the dots)")
+    ap.add_argument("--fill-vote", type=int, default=1, help="--fill patch: matched patches vote (average) at the coarse passes (1), or every pass copies centres (0)")
+    ap.add_argument("--fill-keep", type=float, default=64.0, help="--spec-fill: texels the rest view shows at most this many texels per still px are kept")
+    ap.add_argument("--chunk", type=int, default=None, help="pixel-body pairs per render chunk (default: the checkpoint's); less: less memory")
+    ap.add_argument("--fill-fp", type=float, default=4.0, help="--spec-fill: seen = at most this many texels per still pixel at rest")
+    ap.add_argument("--tile-init", type=int, default=0, help="start each body's skin as its top (what faces up at rest) repeated this many times round it (3)")
+    ap.add_argument("--cap-res", type=int, default=64, help="--caps disc: texels across a cap's paint disc (relief: half)")
     ap.add_argument("--wskin", type=float, default=0.0, help="training: the skin a camera never saw sharply (finer than --skin-fp) "
                     "must match the pattern statistics (Gram matrices of --skin-layers) of the skin it did, body by body")
     ap.add_argument("--skin-fp", type=float, default=2.0, help="--wskin: seen sharply = at most this many texels per still pixel at rest")
@@ -431,6 +545,14 @@ def main():
     if a.cavity is not None:
         ta.cavity, ta.cav_r = a.cavity, a.cav_r
         ck["args"] = {**ck["args"], "cavity": a.cavity, "cav_r": a.cav_r}
+    convert = False
+    if a.caps is not None and a.caps != getattr(ta, "caps", "proj"):  # caps switched on: textures are re-spanned and the discs seeded after loading
+        assert getattr(ta, "caps", "proj") == "proj" and a.caps == "disc", "only proj -> disc"
+        ta.caps, ta.cap_res = a.caps, a.cap_res
+        ck["args"] = {**ck["args"], "caps": a.caps, "cap_res": a.cap_res}
+        convert = True
+    if a.chunk is not None:
+        ta.chunk = a.chunk
     cpu = torch.device("cpu")
     tb0 = Mixed.from_state(ck["tubes"], ta, cpu)
     is_filler = ck["tubes"].get("is_filler")
@@ -441,13 +563,15 @@ def main():
     if a.traj:
         tj = torch.load(a.traj)
         traj, rads, rep["sim"] = tj["traj"], tj["rads"], tj["stats"]
-        log(f"trajectory from {a.traj}")
+        rep["sim_args"] = tj.get("args", {})
+        log(f"trajectory from {a.traj}" + (" (funhouse simulated)" if rep["sim_args"].get("fh_sim", 0) else ""))
     else:
         pile = Pile(s0["C"][0], s0["r"], s0["f"], a, S, log, still=is_filler.bool() if is_filler is not None else None)
         if is_filler is not None:
             log(f"{int(is_filler.sum())} fillers (objfill.py): pushed about, but not driven")
         traj, rads, stats = pile.run(log)
         rep["sim"] = stats
+        rep["sim_args"] = vars(a)
         torch.save(dict(traj=traj, rads=rads, stats=stats, args=vars(a)), f"{a.out}/traj.pt")
     if a.sim_only:
         json.dump(rep, open(f"{a.out}/report.json", "w"), indent=1)
@@ -460,6 +584,105 @@ def main():
     from ring import Ring
     dev = pick_device()
     tb = Mixed.from_state(ck["tubes"], ta, dev)
+    if a.spec_fill:  # every body's unseen skin filled with its seen skin's spectrum (before --caps disc: proj spans)
+        assert getattr(ta, "caps", "proj") == "proj" or convert, "--spec-fill works on proj-span maps (before --caps disc)"
+        rig0 = Rig(0.0, 0.8, ta, dev)
+        rig0.load_state_dict(ck["rig"])
+        ta2 = argparse.Namespace(**vars(ta)); ta2.mip = 1; ta2.caps = "proj"
+        Z2 = 2 * S
+        cam2 = Cam(np.eye(3), Z2, Z2, (S / 2, S / 2, 0.0), S, zoom=2.0)
+        with torch.no_grad():
+            # the residual paint folds into the fine one, so one map holds the paint
+            Kt, _, Ha, Wl = tb.tex0.shape
+            k_ = Ha // tb.tex.shape[2]
+            up = F.interpolate(torch.cat([tb.tex[:, :, -1:], tb.tex, tb.tex[:, :, :1]], 2), size=(Ha + 2 * k_, Wl), mode="bilinear", align_corners=False)
+            tb.tex0.copy_(tb.tex0 + up[:, :, k_:k_ + Ha])
+            tb.tex.zero_()
+            sp_ = tb.spheres()
+            o = render(tb, sp_, cam2, build_pairs(sp_, cam2, 4.0), [rig0()], ta2, aux=True)
+            pix_, obj_ = o["pix"], o["obj"]
+            share = o["ep"][0] / o["den"][0][pix_]
+            top_ = torch.zeros(Z2 * Z2, device=dev).scatter_reduce(0, pix_, share, "amax", include_self=True)
+            dom = (share >= top_[pix_] - 1e-9) & (share > 0.3)
+            fp_ = torch.maximum(o["fpa"][0] * Ha, o["fpl"][0] * (Wl - 1)) * 2.0  # texels per still pixel
+            o_fpa, o_fpl, o_tu, o_tv = o["fpa"][0], o["fpl"][0], o["tu"][0], o["tv"][0]
+            idx = (obj_ * Ha + (o["tu"][0] * Ha).long() % Ha) * Wl + (o["tv"][0].clamp(0, 1) * (Wl - 1)).round().long()
+            best = torch.full((Kt * Ha * Wl,), 1e3, device=dev).scatter_reduce(0, idx[dom], fp_[dom], "amin", include_self=True)
+            maj = lambda q: (F.avg_pool2d(F.pad(torch.cat([q[:, :, -1:], q, q[:, :, :1]], 2), (1, 1, 0, 0), mode="replicate"), 3, stride=1) > 0.4).float()
+            sharp = maj((best.reshape(Kt, 1, Ha, Wl) <= a.fill_fp).float())  # where patches come from
+            # what the rest view shows, kept: each pixel marks its whole footprint (a cell of the mip level
+            # its footprint selects), not just the texel under its centre, which at grazing angles misses most
+            fpo = torch.maximum(o_fpa * Ha, o_fpl * (Wl - 1))  # texels per output pixel
+            lv_ = torch.log2(fpo.clamp(min=1)).ceil().long().clamp(0, 5)
+            seen = torch.zeros(Kt, 1, Ha, Wl, device=dev)
+            for l_ in range(6):
+                sl_ = dom & (lv_ == l_) & (fp_ <= a.fill_keep)
+                Hq, Wq = max(Ha >> l_, 1), max(Wl >> l_, 1)
+                gi = (obj_[sl_] * Hq + (o_tu[sl_] * Hq).long() % Hq) * Wq + (o_tv[sl_].clamp(0, 1) * (Wq - 1)).round().long()
+                cell = torch.zeros(Kt * Hq * Wq, device=dev).index_fill_(0, gi, 1.0).reshape(Kt, 1, Hq, Wq)
+                seen = torch.maximum(seen, F.interpolate(cell, size=(Ha, Wl), mode="nearest"))
+            del o
+            if a.fill == "spec":
+                tb.tex0.copy_(spec_fill(tb.tex0, seen, iters=a.spec_fill))
+                if hasattr(tb, "bump"):
+                    sb = (F.adaptive_avg_pool2d(seen, tb.bump.shape[1:]) > 0.5).float()
+                    tb.bump.copy_(spec_fill(tb.bump[:, None], sb, iters=a.spec_fill)[:, 0])
+            else:  # patches of each body's own seen skin, the relief carried along with the paint
+                for k in range(Kt):
+                    if not (0.01 < float(seen[k].mean()) < 0.99):
+                        continue
+                    if float(sharp[k].mean()) < 0.005:
+                        continue
+                    x_, src_ = patch_fill(tb.tex0[k], seen[k], torch.sigmoid(tb.tex0[k]), seed=k, vote=a.fill_vote, msrc=sharp[k])
+                    tb.tex0[k] = x_
+                    if hasattr(tb, "bump"):
+                        tb.bump[k] = carry(tb.bump[k][None], src_, Ha, Wl)[0]
+        pk = list(range(0, Kt, max(1, Kt // 8)))[:8]
+        save(torch.cat([F.pad(seen[k], (0, 4, 0, 4), value=0.5).expand(3, -1, -1) for k in pk], 2), f"{a.out}/fill_seen.png")
+        save(torch.cat([F.pad(torch.sigmoid(tb.tex0[k]), (0, 4, 0, 4), value=1.0) for k in pk], 2), f"{a.out}/fill_paint.png")
+        log(f"fill ({a.fill}): {float(seen.mean()):.1%} of the paint shown at rest (kept), {float(sharp.mean()):.1%} sharply (<= {a.fill_fp} texels "
+            f"per still px: the source); the hidden rest filled from its body's own")
+    if a.tile_init:  # every side of each body starts as its own top, repeated round it
+        assert getattr(ta, "caps", "proj") == "proj" or convert, "--tile-init works on proj-span maps (before --caps disc)"
+        with torch.no_grad():
+            roll_tile(tb, tb.spheres(), n=a.tile_init)
+        log(f"skins tiled from each body's top, {a.tile_init} copies round")
+    if convert:
+        with torch.no_grad():
+            Wb = convert_caps(tb, tb.spheres())
+        if a.spec_fill:
+            # the discs were seeded from the tube's map, whose texels shrink around toward each pole (the
+            # grain pinches there): refill each disc's inner half from the spectrum of its own outer ring,
+            # in the disc's flat coordinates
+            with torch.no_grad():
+                for n_ in ("capt", "capb"):
+                    if hasattr(tb, n_):
+                        P_ = getattr(tb, n_)
+                        D_ = P_.shape[-1]
+                        xs = (torch.arange(D_, device=dev) + 0.5) / D_ * 2 - 1
+                        rr_ = torch.sqrt(xs[None] ** 2 + xs[:, None] ** 2)
+                        known = ((rr_ > 0.5) & (rr_ <= 1.0)).float()[None, None]
+                        flat = P_.reshape(-1, *P_.shape[-3:]) if n_ == "capt" else P_.reshape(-1, 1, D_, D_)
+                        if a.fill == "spec":
+                            filled = spec_fill(flat, known.expand(flat.shape[0], 1, D_, D_), iters=a.spec_fill, wrap_rows=False)
+                            P_.copy_(filled.reshape(P_.shape))
+                        elif n_ == "capt":
+                            srcs = []
+                            for i_ in range(flat.shape[0]):
+                                x_, src_ = patch_fill(flat[i_], known[0], torch.sigmoid(flat[i_]), iters=(4, 3), wrap_rows=False, seed=i_, vote=a.fill_vote)
+                                flat[i_] = x_
+                                srcs.append(src_)
+                            P_.copy_(flat.reshape(P_.shape))
+                        else:  # the caps' relief follows their paint
+                            for i_ in range(flat.shape[0]):
+                                flat[i_] = carry(flat[i_], srcs[i_], tb.capt.shape[-1], tb.capt.shape[-1])
+                            P_.copy_(flat.reshape(P_.shape))
+            log("caps: each disc's inner half refilled from its outer ring's spectrum")
+        if Wb is not None:  # the relief is longer now: its checkpoint must say so to reload
+            ta.bump_along = Wb
+            ck["args"] = {**ck["args"], "bump_along": Wb}
+        log(f"caps: textures re-spanned to geodesic caps (paint {tuple(tb.tex0.shape[2:])}, relief {Wb} along), "
+            f"{ta.cap_res}px disc textures seeded from them")
     rig = Rig(0.0, 0.8, ta, dev)
     rig.load_state_dict(ck["rig"])
     grower = None
@@ -519,7 +742,7 @@ def main():
     hue_w = a.hue_walk * walk(Kb) + a.hue_drift * 2 * math.pi * torch.arange(T_, device=dev)[:, None] / T_ if (a.hue_walk or a.hue_drift) else None
     tex_w = torch.stack([a.tex_turn * walk(Kb), a.tex_slide * walk(Kb)], -1) if (a.tex_turn or a.tex_slide) else None
     fh = None
-    if a.funhouse:  # plane waves of displacement on the torus: k (cycles per canvas), c (cycles per loop), a random direction each
+    if a.funhouse and not rep["sim_args"].get("fh_sim", 0):  # plane waves of displacement on the torus: k (cycles per canvas), c (cycles per loop), a random direction each
         W_ = torch.tensor([[float(x) for x in w.split(",")] for w in a.fh_waves.split(";")])
         dirs = torch.randn(len(W_), 3, generator=gen) * torch.tensor([1.0, 1.0, 0.4])
         dirs = dirs / dirs.norm(dim=-1, keepdim=True)
@@ -542,7 +765,8 @@ def main():
         C = sp["C"][0]
         seg = (C[:, 1:] - C[:, :-1]).norm(dim=-1)
         s = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], -1)
-        sp["s"], sp["s_lo"], sp["s_len"] = s, -r[:, 0], s[:, -1] + r[:, 0] + r[:, -1]
+        sp["s"] = s
+        sp["s_lo"], sp["s_len"] = tex_span(s, r, ta)
         if hue_w is not None:
             sp["hue"] = hue_w[t % T_]
         if tex_w is not None:
@@ -562,6 +786,10 @@ def main():
             groups.append({"params": [tb.tex0], "lr": a.lr_prior})
         if a.lr_bump > 0 and hasattr(tb, "bump"):
             groups.append({"params": [tb.bump], "lr": a.lr_bump})
+        if hasattr(tb, "capt"):  # the caps' discs learn as the paint (and relief) they continue
+            groups.append({"params": [tb.capt], "lr": a.lr_prior if a.lr_prior > 0 else a.lr_tex})
+            if a.lr_bump > 0 and hasattr(tb, "capb"):
+                groups.append({"params": [tb.capb], "lr": a.lr_bump})
 
         def paint_hf():  # the prior paint's luminance finer than --hf-r texels (wrapping around)
             Y_ = (torch.sigmoid(tb.tex0) * torch.tensor([0.299, 0.587, 0.114], device=dev)[:, None, None]).sum(1, keepdim=True)
@@ -622,6 +850,14 @@ def main():
                     Mg, Mb = mean(mm).detach(), mean(1 - mm)
                     tot = tot + ((Gb - Gg) ** 2).sum((1, 2)).div((Gg ** 2).sum((1, 2))).mean() + ((Mb - Mg) ** 2).sum(1).div((Mg ** 2).sum(1)).mean()
                 return tot
+        with torch.no_grad():
+            sp_rest = tb.spheres()
+            zmid = float(sp_rest["C"][0][..., 2].mean())
+
+        def rest_sph():  # the still's pose, frozen: what --train-rest trains on
+            sp = dict(sp_rest)
+            return sp
+
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
@@ -632,18 +868,41 @@ def main():
             js = [rng.randrange(len(pool)) for _ in range(a.mb)]
             ts = [rng.randrange(pool[j][0].shape[0]) for j in js]
             with torch.no_grad():
-                sps = [frame_sph(t, j) for t, j in zip(ts, js)]
+                sps = [frame_sph(t, j) if not a.train_rest else rest_sph() for t, j in zip(ts, js)]
                 # some frames through a tilted camera, so the flanks and undersides the still never
                 # showed get trained too (a lifted or tilted body shows them)
                 cams = [top if rng.random() >= a.view_frac else
                         Cam(rot_x(math.radians(rng.uniform(10, a.view_tilt))) @ rot_z(rng.uniform(0, 2 * math.pi)), S, S, (S / 2, S / 2, 0.0), S)
                         for _ in sps]
+                for ci_ in range(len(cams)):
+                    if rng.random() < a.view_sphere:
+                        # from anywhere on the sphere, below the floor too (hidden), the light turning with
+                        # the camera: every underbelly seen in place, among its real neighbours
+                        # within --sphere-cone of straight down or straight up (side-on, a ray runs along the
+                        # endlessly tiled slab and meets dozens of copies)
+                        th_ = math.acos(rng.uniform(math.cos(math.radians(a.sphere_cone)), 1.0))
+                        th_ = th_ if rng.random() < a.sphere_top else math.pi - th_
+                        cm = Cam(rot_x(th_) @ rot_z(rng.uniform(0, 2 * math.pi)), S, S, (S / 2, S / 2, zmid), S)
+                        cm.env = True
+                        cams[ci_] = cm
                 prs = [padded(build_pairs(sp, cm, 4.0)) for sp, cm in zip(sps, cams)]
             ref = rig()
             if grower is not None:  # grow the textures afresh: the gradient reaches the rule
                 tb.tex0 = grower(size=tsz)
             acts, pens = [], []
+            opt.zero_grad()
+
+            def relief():  # the frames' spheres were built without gradient; the relief maps are the
+                # parameters' own, rebuilt with it (until 2026-11-07 they were not, and --lr-bump trained nothing)
+                out = {}
+                if hasattr(tb, "bump") and a.lr_bump > 0:
+                    out["bump"] = ta.bump_amp * torch.tanh(tb.bump)
+                if hasattr(tb, "capb") and a.lr_bump > 0:
+                    out["capb"] = ta.bump_amp * torch.tanh(tb.capb)
+                return out
+
             for sp, pr, cm in zip(sps, prs, cams):
+                sp = {**sp, **relief()}
                 lt_ = {k: (v.detach() if torch.is_tensor(v) else v) for k, v in ref.items()}
                 if a.train_light > 0:
                     az_ = math.atan2(float(lt_["l"][1]), float(lt_["l"][0])) + math.radians(rng.uniform(-a.train_light, a.train_light))
@@ -653,7 +912,16 @@ def main():
                     sp = dict(sp)
                     sp["tex_shift"] = torch.stack([(torch.rand(tb.K, device=dev) * 2 - 1) * a.train_turn,
                                                    (torch.rand(tb.K, device=dev) * 2 - 1) * a.train_turn / 2], -1)
-                o = render(tb, sp, cm, pr, [lt_], ta, aux=True)
+                if a.train_sym > 0:
+                    # a share of the bodies, each frame, shown rolled any amount about its spine, mirrored, and/or
+                    # end for end: every side of the skin, paint and relief together, must read as the top does,
+                    # while each body keeps its slot in the pile
+                    sp = dict(sp)
+                    pick = (torch.rand(tb.K, device=dev) < a.train_sym).float()
+                    sp["tex_shift"] = torch.stack([torch.rand(tb.K, device=dev) * pick, torch.zeros(tb.K, device=dev)], -1)
+                    sgn = torch.where(torch.rand(tb.K, 2, device=dev) < 0.5, -1.0, 1.0)
+                    sp["tex_sign"] = torch.where(pick[:, None] > 0, sgn, torch.ones_like(sgn))
+                o = render(tb, sp, cm, pr, [lt_], ta, aux=True, ground="none" if getattr(cm, "env", False) else "tex")
                 acts.append(rg.act(MultiScaleCrop(224 / S, 512)(o["img"])))
                 # paint may not do the geometry's job: no texture darker than --dark-floor, and none darker
                 # toward a body's limb than 75% of its front (objtube.py's rim term)
@@ -667,15 +935,21 @@ def main():
                 rim = (band * torch.relu(0.75 * refY.detach()[obj] - Y) ** 2).sum() / band.sum().clamp(min=1) / 0.01
                 dark = (own * torch.relu(a.dark_floor - Y) ** 2).sum() / own.sum().clamp(min=1) / 0.01
                 pens.append(a.wrim * rim + a.wdark * dark)
+                # each frame's graph is freed as soon as it is used (two at once ran out of memory)
+                ((-acts[-1] + acts[-1].detach().abs() * pens[-1]) / len(sps)).backward()
+                acts[-1], pens[-1] = acts[-1].detach(), pens[-1].detach()
+                del o
             act = torch.stack(acts).mean()
             pen = torch.stack(pens).mean()
+            extra = 0
             if a.whf > 0:
-                pen = pen + a.whf * paint_hf() / hf0
+                extra = extra + a.whf * paint_hf() / hf0
             if a.wskin > 0:
                 sk = skin_loss()
-                pen = pen + a.wskin * sk
-            opt.zero_grad()
-            (-act + act.detach().abs() * pen).backward()
+                extra = extra + a.wskin * sk
+            if torch.is_tensor(extra):
+                (act.abs() * extra).backward()
+                pen = pen + extra.detach()
             opt.step()
             if it % 25 == 0 or it == a.train - 1:
                 log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + f" (frames {ts})")
