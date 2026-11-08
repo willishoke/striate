@@ -19,7 +19,10 @@ the frame is wherever the body's silhouette falls:
   texture   per body, in its own coordinates: along the spine (end caps continue past the ends) x
             around it (--tex-around x --tex-along logits), initialised by projecting the still, with our
             own overhead shading divided out, onto the front of the body. The ground has its own
-            low-res texture.
+            low-res texture. --caps disc: along runs over each end cap by its geodesic (not its
+            projection on the spine, which stretched the paint radially toward the pole), and near the
+            pole, where the around coordinate pinches, each cap reads its own disc texture (azimuthal
+            equidistant), paint and relief.
   light     Lambert + Blinn specular, exposure-compensated as objsurf.py. Cast shadows are traced
             against every sphere of every body (closed-form ray-sphere distance, penumbra widening
             with distance), so a body shades its neighbours, the ground and its own underside in any
@@ -157,6 +160,10 @@ class Tubes(torch.nn.Module):
         self.disp = torch.nn.Parameter(torch.zeros(K, getattr(a, "disp_around", 8), getattr(a, "disp_along", 12), device=dev))
         if getattr(a, "bump_amp", 0.0) > 0:  # fine relief on the texture's grid: the pattern as geometry, not paint
             self.bump = torch.nn.Parameter(torch.zeros(K, a.bump_around, a.bump_along, device=dev))
+        if getattr(a, "caps", "proj") == "disc":  # each end cap's own square texture (paint logits, relief), read toward its pole
+            self.capt = torch.nn.Parameter(torch.zeros(K, 2, 3, a.cap_res, a.cap_res, device=dev))
+            if getattr(a, "bump_amp", 0.0) > 0:
+                self.capb = torch.nn.Parameter(torch.zeros(K, 2, a.cap_res // 2, a.cap_res // 2, device=dev))
 
     def f(self):
         return 0.25 + torch.sigmoid(self.fq)
@@ -218,9 +225,11 @@ class Tubes(torch.nn.Module):
             b = Bs[-1] - (Bs[-1] * T[..., i, :]).sum(-1, keepdim=True) * T[..., i, :]
             Bs.append(b / (b.norm(dim=-1, keepdim=True) + 1e-6))
         Bv = torch.stack(Bs, -2)
-        out = dict(C=C, r=r, T=T, Bv=Bv, s=s, s_lo=-r[:, 0], s_len=Lt + r[:, 0] + r[:, -1], f=f,
+        s_lo, s_len = tex_span(s, r, self.a)
+        out = dict(C=C, r=r, T=T, Bv=Bv, s=s, s_lo=s_lo, s_len=s_len, f=f,
                    disp=getattr(self.a, "disp_amp", 0.0) * torch.tanh(self.disp) if hasattr(self, "disp") else None,
-                   bump=self.a.bump_amp * torch.tanh(self.bump) if hasattr(self, "bump") else None)
+                   bump=self.a.bump_amp * torch.tanh(self.bump) if hasattr(self, "bump") else None,
+                   capb=self.a.bump_amp * torch.tanh(self.capb) if hasattr(self, "capb") else None)
         if sub is not None:
             out = {k: (None if v is None else v[:, sub] if k in ("C", "T", "Bv") else v[sub]) for k, v in out.items()}
         return out
@@ -288,8 +297,9 @@ class Mixed(Tubes):
         super().__init__(ctl, rad, a, dev)
         self.coil = Coils(P, hand, a, dev)
         del self.coil.tex, self.coil.ground, self.coil.disp
-        if hasattr(self.coil, "bump"):
-            del self.coil.bump
+        for n in ("bump", "capt", "capb"):
+            if hasattr(self.coil, n):
+                delattr(self.coil, n)
         self.register_buffer("is_coil", torch.tensor(is_coil, dtype=torch.bool, device=dev))
 
     def base(self):
@@ -875,6 +885,338 @@ def rip_sample(rm, k, tu, tv, lu, lv):
     return out
 
 
+def tex_span(s, r, a):
+    """Texture span along each body (s_lo, s_len), px: the spine and a cap past each end. --caps proj:
+    a cap spans its radius (the hit's projection on the spine); geo/disc: its quarter meridian (pi/2 r),
+    so the paint is not stretched toward the pole."""
+    cf = 1.0 if getattr(a, "caps", "proj") == "proj" else math.pi / 2
+    return -cf * r[:, 0], s[:, -1] + cf * (r[:, 0] + r[:, -1])
+
+
+def cap_coords(sl, s_end, r0, re, mode):
+    """A hit's arclength sl (px; the projection on the spine, running past both ends over the caps) ->
+    (along px, cap (0 start, 1 end, -1 neither), rho: the geodesic distance from that cap's pole as a
+    fraction of its quarter meridian, 1 at the rim and 0 at the pole). mode 'proj' keeps sl as it is."""
+    o0, o1 = (-sl / r0).clamp(0, 0.999), ((sl - s_end) / re).clamp(0, 0.999)
+    a0, a1 = torch.asin(o0), torch.asin(o1)
+    st, en = sl < 0, sl > s_end
+    cap = torch.where(st, torch.zeros_like(sl, dtype=torch.long), torch.where(en, torch.ones_like(sl, dtype=torch.long), -torch.ones_like(sl, dtype=torch.long)))
+    rho = torch.where(st, 1 - a0 / (math.pi / 2), torch.where(en, 1 - a1 / (math.pi / 2), torch.ones_like(sl)))
+    if mode == "proj":
+        return sl, cap, rho
+    return torch.where(st, -r0 * a0, torch.where(en, s_end + re * a1, sl)), cap, rho
+
+
+def cap_weight(rho, cap):
+    """Share of the cap's disc texture: all of it within 0.45 of the pole, none past 0.75 (smoothstep)."""
+    x = ((0.75 - rho) / 0.3).clamp(0, 1)
+    return x * x * (3 - 2 * x) * (cap >= 0)
+
+
+def disc_build(t, lmax=4):
+    """Mip pyramid of square cap textures t (M, C, D, D), flattened into one buffer."""
+    M, Cn, D, _ = t.shape
+    lv, flat, off, n = [t], [], [], 0
+    for i in range(min(lmax, int(math.log2(D)) - 1)):
+        lv.append(F.avg_pool2d(lv[-1], 2))
+    for x in lv:
+        flat.append(x.permute(0, 2, 3, 1).reshape(-1, Cn))
+        off.append(n)
+        n += flat[-1].shape[0]
+    return dict(flat=torch.cat(flat), off=torch.tensor(off, device=t.device), L=len(lv) - 1, D=D)
+
+
+def disc_sample(dm, idx, x, y, lev):
+    """Bilinear (clamped) at x, y in [0, 1] of cap texture idx, linear between mip levels lev (log2
+    texels per pixel)."""
+    lev = lev.clamp(0, dm["L"])
+    l0 = lev.floor().long().clamp(max=max(dm["L"] - 1, 0))
+    fl = (lev - l0).clamp(0, 1)[..., None]
+    out = 0
+    for dl, wl in ((0, 1 - fl), (1, fl)):
+        l = (l0 + dl).clamp(max=dm["L"])
+        Dl = dm["D"] >> l
+        xx = (x * Dl - 0.5).clamp(0, None)
+        yy = (y * Dl - 0.5).clamp(0, None)
+        xx, yy = torch.minimum(xx, (Dl - 1).float()), torch.minimum(yy, (Dl - 1).float())
+        x0, y0 = torch.minimum(xx.floor(), (Dl - 2).clamp(min=0).float()), torch.minimum(yy.floor(), (Dl - 2).clamp(min=0).float())
+        fx, fy = (xx - x0)[..., None], (yy - y0)[..., None]
+        x0, y0 = x0.long(), y0.long()
+        x1, y1 = torch.minimum(x0 + 1, Dl - 1), torch.minimum(y0 + 1, Dl - 1)
+        base = dm["off"][l] + idx * (Dl * Dl)
+        g = lambda yi, xi: dm["flat"][base + yi * Dl + xi]
+        out = out + wl * ((1 - fy) * ((1 - fx) * g(y0, x0) + fx * g(y0, x1)) + fy * ((1 - fx) * g(y1, x0) + fx * g(y1, x1)))
+    return out
+
+
+def sym_coords(tu, tv, k, shift, sign):
+    """The texture turned and slid (shift (K, 2): turns, fraction of the span) and mirrored around and
+    reversed along (sign (K, 2), +-1) on body k: where the paint at (tu, tv) comes from."""
+    if sign is not None:
+        su, sv = sign[k, 0], sign[k, 1]
+        tu, tv = (su * tu) % 1.0, 0.5 + sv * (tv - 0.5)
+    if shift is not None:
+        tu, tv = (tu + shift[k, 0]) % 1.0, tv + shift[k, 1]
+    return tu, tv
+
+
+def spec_fill(t, m, iters=80, seed=0, wrap_rows=True):
+    """Fill the unseen texels (m < 0.5) of maps t (K, C, Ha, Wl) with texture of the seen texels' own
+    spectrum, body by body: alternating projections (Papoulis-Gerchberg) that keep the seen texels and
+    give the whole map the seen part's amplitude spectrum, keeping the current phases. The fill has the
+    top's grain, scale and colours, continues from its edges, and neither repeats nor blurs. Around
+    (rows) wraps and along is mirrored to make it periodic; wrap_rows=False mirrors both (a cap's disc). Colours are decorrelated first (the seen texels'
+    principal axes), so the fill does not turn into colour noise. CPU."""
+    K, Cn, Ha, Wl = t.shape
+    dev = t.device
+    t, m = t.detach().cpu().double(), m.detach().cpu().double()
+    out = t.clone()
+    g = torch.Generator().manual_seed(seed)
+    ext1 = lambda z: torch.cat([z, z.flip(-1)], -1)
+    ext = ext1 if wrap_rows else (lambda z: torch.cat([ext1(z), ext1(z).flip(-2)], -2))
+    for k in range(K):
+        mk = m[k, 0] > 0.5
+        if mk.float().mean() < 0.01 or mk.float().mean() > 0.99:
+            continue
+        x = t[k].reshape(Cn, -1)
+        seen = x[:, mk.flatten()]
+        mu = seen.mean(1, keepdim=True)
+        if Cn > 1:
+            _, V = torch.linalg.eigh(torch.cov(seen))
+        else:
+            V = torch.ones(1, 1, dtype=t.dtype)
+        y = (V.T @ (x - mu)).reshape(Cn, Ha, Wl)
+        me = ext(mk[None].double())
+        A = torch.fft.fft2(ext(y) * me).abs() / me.mean().sqrt()  # the seen part's amplitude spectrum (windowed)
+        sd = (V.T @ (seen - mu)).std(1)[:, None, None]
+        z = torch.where(mk[None], y, torch.randn(Cn, Ha, Wl, generator=g, dtype=t.dtype) * sd)
+        for _ in range(iters):
+            Z = torch.fft.fft2(ext(z))
+            z = torch.where(mk[None], y, torch.fft.ifft2(A * torch.exp(1j * torch.angle(Z))).real[..., :Ha, :Wl])
+        out[k] = (V @ z.reshape(Cn, -1) + mu).reshape(Cn, Ha, Wl)
+    return out.float().to(dev)
+
+
+def _pad(x, p, wrap_rows):
+    """x (C, H, W): rows wrap (or mirror), columns mirror, by p."""
+    x = torch.cat([x[:, -p:], x, x[:, :p]], 1) if wrap_rows else F.pad(x[None], (0, 0, p, p), mode="reflect")[0]
+    return F.pad(x[None], (p, p, 0, 0), mode="reflect")[0]
+
+
+def _patches(x, ps, wrap_rows):
+    """(H * W, C * ps * ps): the patch centred on every texel."""
+    C, H, W = x.shape
+    return F.unfold(_pad(x, ps // 2, wrap_rows)[None], ps)[0].T
+
+
+def patch_fill(x, m, feat, ps=7, iters=(5, 4, 3), wrap_rows=True, seed=0, max_src=12000, vote=True, msrc=None):
+    """Fill the unseen texels (m < 0.5) of one map x (C, H, W) from patches of its seen texels, coarse to
+    fine (texture optimisation, Kwatra et al. 2005): each unseen patch is matched (in feat, (Cf, H, W),
+    e.g. the albedo) to its nearest fully seen patch and the matches vote; a last pass copies, for each
+    unseen texel, the centre of its own best patch (vote=False: every pass does, at every scale: no
+    averaging anywhere, the most contrast), so the fill keeps the seen texture's own structure
+    (dots, edges) sharp, neither repeating on a grid nor blurring. Returns the filled x and, per texel,
+    the (row, col) it was copied from (seen texels: themselves), to carry registered maps along. msrc:
+    where source patches may come from (default m): e.g. only the sharply seen skin, while m keeps all
+    the skin the rest view shows."""
+    dev = x.device
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    C, H, W = x.shape
+    L = len(iters)
+    msrc = m if msrc is None else msrc
+    pyr = [(x, feat, m, msrc)]
+    for _ in range(L - 1):
+        xx, ff, mm, ms = pyr[-1]
+        pyr.append((F.avg_pool2d(xx[None], 2)[0], F.avg_pool2d(ff[None], 2)[0], (F.avg_pool2d(mm[None], 2)[0] > 0.75).float(),
+                    (F.avg_pool2d(ms[None], 2)[0] > 0.75).float()))
+    est = None
+    srcmap = torch.arange(H * W, device=dev)
+    for lev in range(L - 1, -1, -1):
+        xl, fl, ml, msl = pyr[lev]
+        Hl, Wl = xl.shape[1:]
+        seen = ml[0] > 0.5
+        if est is None:  # start the unseen skin as random draws of seen texels (a flat start only ever matches flat patches)
+            sv = (msl[0] > 0.5).flatten().nonzero()[:, 0]
+            if len(sv) == 0:
+                sv = seen.flatten().nonzero()[:, 0]
+            pick = sv[torch.randint(len(sv), (Hl * Wl,), generator=g).to(dev)]
+            cx = torch.where(seen, xl, xl.reshape(C, -1)[:, pick].reshape(C, Hl, Wl))
+            cf = torch.where(seen, fl, fl.reshape(fl.shape[0], -1)[:, pick].reshape(fl.shape[0], Hl, Wl))
+        else:
+            ux = F.interpolate(est[0][None], size=(Hl, Wl), mode="bilinear", align_corners=False)[0]
+            uf = F.interpolate(est[1][None], size=(Hl, Wl), mode="bilinear", align_corners=False)[0]
+            cx, cf = torch.where(seen, xl, ux), torch.where(seen, fl, uf)
+        for psl in (ps, 5, 3):  # the largest patches with enough wholly seen examples at this scale
+            src = (_patches(msl, psl, wrap_rows).min(1)[0] > 0.5).nonzero()[:, 0]
+            if len(src) >= 64:
+                break
+        ps_ = ps
+        ps = psl
+        if len(src) == 0:  # no wholly seen patch at all: patches centred on seen texels
+            src = (msl[0] > 0.5).flatten().nonzero()[:, 0]
+        if len(src) == 0:  # nothing seen at this scale: pass the start on to the next
+            est, ps = (cx, cf), ps_
+            continue
+        if len(src) > max_src:
+            src = src[torch.randperm(len(src), generator=g)[:max_src].to(dev)]
+        need = (_patches(ml, ps, wrap_rows).min(1)[0] < 0.5)  # patches touching unseen skin
+        for it in range(iters[lev] + (1 if lev == 0 else 0)):
+            Pf, Px = _patches(cf, ps, wrap_rows), _patches(cx, ps, wrap_rows)
+            Sf, Sx = Pf[src], Px[src]
+            last = (lev == 0 and it == iters[lev]) or not vote
+            if last:  # every unseen texel takes the centre of its own best patch
+                tgt = (~seen.flatten()).nonzero()[:, 0]
+            else:  # a lattice of patches over the unseen skin votes
+                st = max(1, ps // 2)
+                yy, xx = torch.meshgrid(torch.arange(0, Hl, st, device=dev), torch.arange(0, Wl, st, device=dev), indexing="ij")
+                lat = (yy * Wl + xx).flatten()
+                tgt = lat[need[lat]]
+            if len(tgt) == 0:
+                break
+            best = torch.empty(len(tgt), dtype=torch.long, device=dev)
+            sn = (Sf ** 2).sum(1)
+            for i in range(0, len(tgt), 4096):
+                q = Pf[tgt[i:i + 4096]]
+                best[i:i + 4096] = (sn[None] - 2 * q @ Sf.T).argmin(1)
+            if last:
+                c = (ps * ps) // 2  # the centre texel within a patch, per channel
+                cxn, cfn = cx.reshape(C, -1).clone(), cf.reshape(fl.shape[0], -1).clone()
+                cxn[:, tgt] = Sx[best].reshape(len(tgt), C, ps * ps)[:, :, c].T
+                cfn[:, tgt] = Sf[best].reshape(len(tgt), -1, ps * ps)[:, :, c].T
+                cx, cf = cxn.reshape(C, Hl, Wl), cfn.reshape(-1, Hl, Wl)
+                srcmap = torch.arange(Hl * Wl, device=dev)
+                srcmap[tgt] = src[best]
+            else:
+                # vote: every matched patch is scattered onto the padded canvas and the overlaps averaged
+                p = ps // 2
+                acc_x = torch.zeros(C, Hl + 2 * p, Wl + 2 * p, device=dev)
+                acc_f = torch.zeros(fl.shape[0], Hl + 2 * p, Wl + 2 * p, device=dev)
+                wsum = torch.zeros(1, Hl + 2 * p, Wl + 2 * p, device=dev)
+                ty, tx = tgt // Wl, tgt % Wl
+                Bx = Sx[best].reshape(len(tgt), C, ps, ps)
+                Bf = Sf[best].reshape(len(tgt), -1, ps, ps)
+                lin = ((ty[:, None, None] + torch.arange(ps, device=dev)[None, :, None]) * (Wl + 2 * p) + (tx[:, None, None] + torch.arange(ps, device=dev)[None, None, :])).flatten()
+                acc_x = acc_x.reshape(C, -1).index_add_(1, lin, Bx.permute(1, 0, 2, 3).reshape(C, -1)).reshape(C, Hl + 2 * p, Wl + 2 * p)
+                acc_f = acc_f.reshape(fl.shape[0], -1).index_add_(1, lin, Bf.permute(1, 0, 2, 3).reshape(fl.shape[0], -1)).reshape(-1, Hl + 2 * p, Wl + 2 * p)
+                wsum = wsum.reshape(1, -1).index_add_(1, lin, torch.ones(1, lin.numel(), device=dev)).reshape(1, Hl + 2 * p, Wl + 2 * p)
+                def unpad(a):  # fold the padding back: rows wrap (or are dropped), columns are dropped
+                    if wrap_rows:
+                        a = a.clone()
+                        a[:, p:2 * p] += a[:, -p:]
+                        a[:, -2 * p:-p] += a[:, :p]
+                    return a[:, p:-p, p:-p]
+                ax, af, ws = unpad(acc_x), unpad(acc_f), unpad(wsum)
+                upd = (~seen) & (ws[0] > 0)
+                cx = torch.where(upd, ax / ws.clamp(min=1e-6), cx)
+                cf = torch.where(upd, af / ws.clamp(min=1e-6), cf)
+        est = (cx, cf)
+        ps = ps_
+    return cx, torch.stack([srcmap // W, srcmap % W], -1).reshape(H, W, 2)
+
+
+def carry(y, src, H, W):
+    """A map y (C, h, w) registered to an (H, W) map that patch_fill rebuilt: each texel of y takes the
+    texel its counterpart was copied from (nearest, rows and columns scaled)."""
+    Cy, h, w = y.shape
+    ii = (torch.arange(h, device=y.device).float() * H / h).long().clamp(max=H - 1)
+    jj = (torch.arange(w, device=y.device).float() * (W - 1) / max(w - 1, 1)).round().long().clamp(max=W - 1)
+    sr = src[ii[:, None], jj[None, :]]  # (h, w, 2) in the big map
+    si = (sr[..., 0].float() * h / H).long().clamp(max=h - 1)
+    sj = (sr[..., 1].float() * (w - 1) / max(W - 1, 1)).round().long().clamp(max=w - 1)
+    return y[:, si, sj]
+
+
+def roll_tile(tb, sph, n=3, band=1 / 24):
+    """Each body's skin made from its own top: the third of the way round (n = 3) that faces up at rest
+    (and so is what the still shows sharply) is repeated n times around the body, cross-faded over
+    band turns at the seams, which fall in the skin the still never showed. Paint (tex0, tex) and relief
+    (bump), column by column along the body, since "up" turns along a curved spine. Proj-span maps."""
+    with torch.no_grad():
+        Bv, T = sph["Bv"][0], sph["T"][0]  # (K, N, 3), rest frames
+        Nv = torch.cross(T, Bv, dim=-1)
+        u_up = torch.atan2(Nv[..., 2], Bv[..., 2]) / (2 * math.pi)  # (K, N): the turn that faces +z
+        s, r = sph["s"], sph["r"]
+        lo, ln = -r[:, 0], s[:, -1] + r[:, 0] + r[:, -1]
+
+        def tile(t):
+            K, Cn, Ha, Wl = t.shape
+            sj = lo[:, None] + torch.linspace(0, 1, Wl, device=t.device)[None] * ln[:, None]  # (K, Wl)
+            idx = (sj.clamp(min=0)[:, :, None] - s[:, None, :]).abs().argmin(-1).clamp(max=s.shape[1] - 1)
+            idx = torch.minimum(idx, torch.full_like(idx, s.shape[1] - 1))
+            up = torch.gather(u_up, 1, idx)  # (K, Wl)
+            u = (torch.arange(Ha, device=t.device).float() / Ha)[None, :, None]  # (1, Ha, 1)
+            ph = (u - up[:, None, :] + 0.5) % 1.0 - 0.5  # (K, Ha, Wl): turns from up
+            acc, wsum = 0, 0
+            half = 0.5 / n
+            for c in range(-(n // 2), n - n // 2):
+                d = (ph - c / n + 0.5) % 1.0 - 0.5  # turns from this copy's centre
+                w = (((half + band) - d.abs()) / (2 * band)).clamp(0, 1)
+                w = w * w * (3 - 2 * w)
+                src_u = (up[:, None, :] + d) % 1.0  # the same offset from the top
+                k = torch.arange(K, device=t.device)[:, None, None].expand(K, Ha, Wl)
+                tv = torch.linspace(0, 1, Wl, device=t.device)[None, None].expand(K, Ha, Wl)
+                acc = acc + w[..., None] * tex_sample(t, k, src_u, tv)
+                wsum = wsum + w
+            return (acc / wsum.clamp(min=1e-6)[..., None]).permute(0, 3, 1, 2)
+
+        tb.tex0.copy_(tile(tb.tex0))
+        tb.tex.copy_(tile(tb.tex))
+        if hasattr(tb, "bump"):
+            tb.bump.copy_(tile(tb.bump[:, None])[:, 0])
+
+
+def convert_caps(tb, sph, grow=10 / 9):
+    """For a body set trained with --caps proj, now built with --caps disc: re-span the along axis of
+    its paint (tex0, tex) and relief (bump) to the geodesic caps, and seed each cap's disc (capt, capb)
+    from the tube texture there, so the first render matches the old one but for the pinch at the poles.
+    The span grows by (pi/2 - 1) of the end radii, so the fine maps (tex0, bump) get grow x more texels
+    along (bicubic), and keep their detail. Returns the relief's new length along (for the args)."""
+    with torch.no_grad():
+        s, r = sph["s"], sph["r"]
+        L, r0, re = s[:, -1], r[:, 0], r[:, -1]
+        lo_o, len_o = -r0, L + r0 + re
+        lo_n, len_n = tex_span(s, r, argparse.Namespace(caps="geo"))
+        q = math.pi / 2
+
+        def s_proj(sg):  # geodesic px along -> the old projected px
+            return torch.where(sg < 0, -r0[:, None] * torch.sin((-sg / r0[:, None]).clamp(max=q)),
+                               torch.where(sg > L[:, None], L[:, None] + re[:, None] * torch.sin(((sg - L[:, None]) / re[:, None]).clamp(max=q)), sg))
+
+        def respan(t, Wn, mode):
+            K, Cn, Ha, Wl = t.shape
+            sg = lo_n[:, None] + torch.linspace(0, 1, Wn, device=t.device)[None] * len_n[:, None]
+            tvo = (s_proj(sg) - lo_o[:, None]) / len_o[:, None]
+            grid = torch.stack([(tvo * 2 - 1)[:, None, :].expand(K, Ha, Wn), torch.linspace(-1, 1, Ha, device=t.device)[None, :, None].expand(K, Ha, Wn)], -1)
+            return F.grid_sample(t, grid, mode=mode, padding_mode="border", align_corners=True)
+
+        W0 = int(round(tb.tex0.shape[-1] * grow / 16)) * 16
+        tb.tex0 = respan(tb.tex0, W0, "bicubic")
+        tb.tex.copy_(respan(tb.tex, tb.tex.shape[-1], "bilinear"))
+        Wb = None
+        if hasattr(tb, "bump"):
+            Wb = int(round(tb.bump.shape[-1] * grow / 16)) * 16
+            tb.bump = torch.nn.Parameter(respan(tb.bump[:, None], Wb, "bicubic")[:, 0])
+
+        def disc_seed(D, maps):
+            K = tb.K
+            xs = (torch.arange(D, device=tb.dev) + 0.5) / D * 2 - 1
+            dy, dx = torch.meshgrid(xs, xs, indexing="ij")
+            rho = torch.sqrt(dx**2 + dy**2).clamp(max=1.0)
+            tu = (torch.atan2(dy, dx) / (2 * math.pi) % 1.0)[None].expand(K, D, D)
+            k = torch.arange(K, device=tb.dev)[:, None, None].expand(K, D, D)
+            outs = []
+            for c in (0, 1):
+                sg = -(1 - rho)[None] * q * r0[:, None, None] if c == 0 else L[:, None, None] + (1 - rho)[None] * q * re[:, None, None]
+                tv = (sg - lo_n[:, None, None]) / len_n[:, None, None]
+                outs.append(sum(tex_sample(m, k, tu, tv) for m in maps).permute(0, 3, 1, 2))  # (K, C, D, D)
+            return torch.stack(outs, 1)
+
+        tb.capt.copy_(disc_seed(tb.capt.shape[-1], [tb.tex0, tb.tex]))
+        if hasattr(tb, "capb"):
+            tb.capb.copy_(disc_seed(tb.capb.shape[-1], [tb.bump[:, None]])[:, :, 0])
+    return Wb
+
+
 def torus_sample(img, x, y):
     """Bilinear sample of img (3, G, G) at (x, y) in canvas periods, wrapping both ways. -> (P, 3)."""
     G = img.shape[-1]
@@ -927,22 +1269,30 @@ def shadow(X, n, l, sph, S, wrap, pen0, pen, H, W, ts=16, tchunk=128):
         a1 = a1 / a1.norm()
         a2 = torch.cross(ld, a1, dim=0)
         ctr = Xt.mean(1)  # (nt, 3)
-        tmax = float((C[:, 2].max() - X[:, 2].min()).clamp(min=1)) / max(float(ld[2]), 0.1)
+        tmax = (float((C[:, 2].max() - X[:, 2].min()).clamp(min=1)) if float(ld[2]) >= 0 else float((X[:, 2].max() - C[:, 2].min()).clamp(min=1))) / max(abs(float(ld[2])), 0.1)
         marg = float(pen0) + float(pen) * tmax + 1.5
     outs = []
-    for i in range(0, Xt.shape[0], tchunk):
+    budget = 6e6  # elements of a (tiles, receivers, spheres) block: a tilted view's tiles each test thousands of spheres
+    i = 0
+    while i < Xt.shape[0]:
+        n_ = tchunk
+        while True:
+            with torch.no_grad():
+                xt, ct = Xt[i:i + n_], ctr[i:i + n_]
+                d = C[None] - ct[:, None]
+                if wrap:
+                    d = torch.cat([d[..., :2] - S * torch.round(d[..., :2] / S), d[..., 2:]], -1)
+                rel = xt - ct[:, None]
+                p1, p2 = rel @ a1, rel @ a2
+                c1, c2, cl = d @ a1, d @ a2, d @ ld
+                ok = ((c1 + rr + marg) > p1.min(1, keepdim=True)[0]) & ((c1 - rr - marg) < p1.max(1, keepdim=True)[0])
+                ok &= ((c2 + rr + marg) > p2.min(1, keepdim=True)[0]) & ((c2 - rr - marg) < p2.max(1, keepdim=True)[0])
+                ok &= (cl + rr) > (rel @ ld).min(1, keepdim=True)[0]
+                M = max(1, int(ok.sum(1).max()))
+            if n_ == 1 or n_ * ts * ts * M <= budget:
+                break
+            n_ = max(1, n_ // 2)
         with torch.no_grad():
-            xt, ct = Xt[i:i + tchunk], ctr[i:i + tchunk]
-            d = C[None] - ct[:, None]  # (tc, Q, 3) centre minus tile centre
-            if wrap:
-                d = torch.cat([d[..., :2] - S * torch.round(d[..., :2] / S), d[..., 2:]], -1)
-            rel = xt - ct[:, None]  # (tc, ts*ts, 3)
-            p1, p2 = rel @ a1, rel @ a2
-            c1, c2, cl = d @ a1, d @ a2, d @ ld
-            ok = ((c1 + rr + marg) > p1.min(1, keepdim=True)[0]) & ((c1 - rr - marg) < p1.max(1, keepdim=True)[0])
-            ok &= ((c2 + rr + marg) > p2.min(1, keepdim=True)[0]) & ((c2 - rr - marg) < p2.max(1, keepdim=True)[0])
-            ok &= (cl + rr) > (rel @ ld).min(1, keepdim=True)[0]
-            M = max(1, int(ok.sum(1).max()))
             idx = torch.argsort((~ok).to(torch.int8), dim=1, stable=True)[:, :M]
             val = torch.gather(ok, 1, idx).float()
             dm = torch.gather(d, 1, idx[..., None].expand(-1, -1, 3))  # (tc, M, 3)
@@ -952,6 +1302,7 @@ def shadow(X, n, l, sph, S, wrap, pen0, pen, H, W, ts=16, tchunk=128):
         else:
             with torch.no_grad():
                 outs.append(_occl(rel, dm, rm, fm, val, l, pen0, pen))
+        i += n_
     out = torch.cat(outs, 0)
     out = out.reshape(Hp // ts, Wp // ts, ts, ts).permute(0, 2, 1, 3).reshape(Hp, Wp)[:H, :W]
     return out.reshape(-1)
@@ -1022,7 +1373,8 @@ class BodyLight(torch.nn.Module):
 S_BLEND = 6.0  # px of arclength over which neighbouring spheres share texture coordinates
 
 
-def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None, bump=None, bshift=None, brim=0.0, mip=None):
+def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=None, s_len=None, bump=None, bshift=None, brim=0.0, mip=None,
+              bsign=None, caps="proj", capb=None):
     """Per pixel-body pair (B, P, 8): front depth w, coverage, normal (3), arclength along the spine,
     and the two around-the-tube components of the hit, each blended over the body's spheres.
     disp (K, Ga, Gl) px: a radial displacement in tube coordinates (around x along). A first pass
@@ -1032,7 +1384,10 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     bump (K, Gb, Lb) px: fine relief on the texture's grid, at the hit's own arclength, turned and slid
     with the paint (bshift, as render's tex_shift); it tilts the normal both ways. brim > 0: its
     displacement fades out toward the outline (full where the surface faces the viewer more than
-    brim), so the outline stays clean while the shading keeps the relief."""
+    brim), so the outline stays clean while the shading keeps the relief. bsign (K, 2): the relief
+    mirrored around / reversed along, as render's tex_sign. caps: how the relief's along coordinate
+    runs over the end caps (cap_coords); 'disc' blends in capb (dict from disc_build of (K * 2, 1, D,
+    D) px), each cap's own square texture, toward its pole, where the around coordinate pinches."""
     q = X0[None, :, None, :] - C[:, obj]  # (B, P, N, 3)
     fk = f[obj][None, :, None]
     ez = e[2] / fk
@@ -1044,16 +1399,18 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     Bk, Nk, Tk = Bv[:, obj], Nv[:, obj], T[:, obj]
     w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)  # front hit, toward the viewer
     g = q + w[..., None] * e  # hit minus centre, world
-    dth = dsl = fa = fl = None
-    if mip is not None:  # the pixel's footprint on the surface: turns around and arclength along, per output pixel
+    dth = dsl = fa = fl = tilt = None
+    if mip is not None or capb is not None:  # the pixel's footprint on the surface: turns around and arclength along, per output pixel
         gp0 = g - (g * Tk).sum(-1, keepdim=True) * Tk
         rr = gp0.norm(dim=-1).clamp(min=0.5)
         eth0 = torch.cross(Tk, gp0 / rr[..., None], dim=-1)
-        fa = mip["px"] / (rr * torch.sqrt((1 - (eth0 * e).sum(-1) ** 2).clamp(min=0.0025))) / (2 * math.pi)
-        fl = mip["px"] / torch.sqrt((1 - (Tk * e).sum(-1) ** 2).clamp(min=0.0025))
+        px_ = mip["px"] if mip is not None else 1.0
+        fa = px_ / (rr * torch.sqrt((1 - (eth0 * e).sum(-1) ** 2).clamp(min=0.0025))) / (2 * math.pi)
+        fl = px_ / torch.sqrt((1 - (Tk * e).sum(-1) ** 2).clamp(min=0.0025))
     if disp is not None or bump is not None:
         th = torch.atan2((g * Nk).sum(-1), (g * Bk).sum(-1))
-        tv = ((s - s_lo[:, None]) / s_len[:, None])[obj][None].expand_as(th)
+        lo_p, len_p = -r[:, 0], s[:, -1] + r[:, 0] + r[:, -1]  # the coarse displacement keeps the projected span
+        tv = ((s - lo_p[:, None]) / len_p[:, None])[obj][None].expand_as(th)
         kk = obj[None, :, None].expand_as(th)
         tu = th / (2 * math.pi) % 1.0
         dl, dth = 0.0, 0.0
@@ -1067,10 +1424,12 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
             Gb, Lb = bump.shape[1:]
             bk = bump[:, None]
             slen = s_len[obj][None, :, None]
-            bv = ((s[obj][None] + (g * Tk).sum(-1)) - s_lo[obj][None, :, None]) / slen  # the hit's own arclength
-            bu = tu
-            if bshift is not None:
-                bu, bv = (tu + bshift[obj, 0][None, :, None]) % 1.0, bv + bshift[obj, 1][None, :, None]
+            sal, cap, rho = cap_coords(s[obj][None] + (g * Tk).sum(-1), s[obj, -1][None, :, None], r[obj, 0][None, :, None], r[obj, -1][None, :, None], caps)
+            bv = (sal - s_lo[obj][None, :, None]) / slen  # the hit's own arclength
+            kk1 = obj[None, :, None].expand_as(th)
+            bu, bv = sym_coords(tu, bv, kk1, bshift, bsign)
+            su_ = bsign[obj, 0][None, :, None] if bsign is not None else 1.0
+            sv_ = bsign[obj, 1][None, :, None] if bsign is not None else 1.0
             hu, hl = 0.5 / Gb, 0.5 / (Lb - 1)
             if mip is not None:  # filtered to the pixel's footprint, and differenced at the filtered texel's size
                 brm = mip["brm"]
@@ -1081,11 +1440,37 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
             else:
                 smp = lambda u_, v_: tex_sample(bk, kk, u_, v_)[..., 0]
             bl = smp(bu, bv)
+            dthb = su_ * (smp((bu + hu) % 1.0, bv) - smp((bu - hu) % 1.0, bv)) / (2 * hu * 2 * math.pi)
+            dsl = sv_ * (smp(bu, bv + hl) - smp(bu, bv - hl)) / (2 * hl * slen)
+            if capb is not None:  # toward each pole, the cap's own texture: x, y on a disc (azimuthal equidistant)
+                wd = cap_weight(rho, cap)
+                re_ = torch.where(cap == 0, r[obj, 0][None, :, None], r[obj, -1][None, :, None])
+                c_ = cap.clamp(min=0)  # (no cap: weight 0, any index will do)
+                ci = obj[None, :, None] * 2 + (torch.where(sv_ < 0, 1 - c_, c_) if torch.is_tensor(sv_) else c_)
+                xd, yd = 0.5 + 0.5 * rho * torch.cos(2 * math.pi * bu), 0.5 + 0.5 * rho * torch.sin(2 * math.pi * bu)
+                Dd = capb["D"]
+                if mip is not None:
+                    fpx = torch.maximum(fa * 2 * math.pi * rr, fl)  # surface px per output px, the larger way
+                    ld = (torch.log2(fpx * Dd / (math.pi * re_)) + mip["bias"]).clamp(0, capb["L"])
+                else:
+                    ld = torch.zeros_like(bu)
+                hd = 0.5 / Dd * torch.exp2(ld)
+                sd = lambda x_, y_: disc_sample(capb, ci, x_, y_, ld)[..., 0]
+                bld = sd(xd, yd)
+                gx = (sd(xd + hd, yd) - sd(xd - hd, yd)) / (2 * hd * math.pi * re_)  # px of relief per px of surface
+                gy = (sd(xd, yd + hd) - sd(xd, yd - hd)) / (2 * hd * math.pi * re_)
+                # the disc's x and y axes on the body: where the turned/mirrored angle is 0 and a quarter turn
+                sh0 = bshift[obj, 0][None, :, None] if bshift is not None else 0.0
+                ph0, ph1 = su_ * (0.0 - 2 * math.pi * sh0), su_ * (math.pi / 2 - 2 * math.pi * sh0)
+                ex = torch.cos(ph0)[..., None] * Bk + torch.sin(ph0)[..., None] * Nk if torch.is_tensor(ph0) else math.cos(ph0) * Bk + math.sin(ph0) * Nk
+                ey = torch.cos(ph1)[..., None] * Bk + torch.sin(ph1)[..., None] * Nk if torch.is_tensor(ph1) else math.cos(ph1) * Bk + math.sin(ph1) * Nk
+                tilt = (wd * gx)[..., None] * ex + (wd * gy)[..., None] * ey
+                bl = (1 - wd) * bl + wd * bld
+                dthb, dsl = (1 - wd) * dthb, (1 - wd) * dsl
             if brim > 0:
                 bl = bl * (((g * e).sum(-1) / rk).clamp(min=0) / brim).clamp(max=1)
             dl = dl + bl
-            dth = dth + (smp((bu + hu) % 1.0, bv) - smp((bu - hu) % 1.0, bv)) / (2 * hu * 2 * math.pi)
-            dsl = (smp(bu, bv + hl) - smp(bu, bv - hl)) / (2 * hl * slen)
+            dth = dth + dthb
         rk = (rk + dl).clamp(min=0.5)
         w = -b / aa + torch.sqrt(torch.relu(rk**2 - m2) / aa + 1e-4)
         g = q + w[..., None] * e
@@ -1099,6 +1484,9 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
         nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-6)
     if dsl is not None:  # the relief's slope along the spine
         nrm = nrm - dsl[..., None] * Tk
+        nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-6)
+    if tilt is not None:  # and on a cap's disc
+        nrm = nrm - tilt
         nrm = nrm / (nrm.norm(dim=-1, keepdim=True) + 1e-6)
     # front-most covering sphere wins, softly. A sphere the ray misses still has a depth (where the ray
     # passes closest), so it must count only by its coverage: else a part of the body rising toward the
@@ -1124,8 +1512,8 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     ca = (lt * (g * Bk).sum(-1)).sum(-1)
     sa = (lt * (g * Nk).sum(-1)).sum(-1)
     out = [wk[..., None], ck[..., None], nk, sl[..., None], ca[..., None], sa[..., None]]
-    if mip is not None:  # the footprint, blended like the texture coordinates
-        out += [(lt * fa).sum(-1)[..., None], (lt * fl).sum(-1)[..., None]]
+    if mip is not None:  # the footprint, blended like the texture coordinates: turns around, px along, px around
+        out += [(lt * fa).sum(-1)[..., None], (lt * fl).sum(-1)[..., None], (lt * fa * 2 * math.pi * rr).sum(-1)[..., None]]
     return torch.cat(out, -1)
 
 
@@ -1155,7 +1543,11 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         mip = dict(px=1.0 / zm, bias=getattr(a, "mip_bias", 0.0))
         if sph.get("bump") is not None:
             mip["brm"] = rip_build(sph["bump"][:, None])
-    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"], sph.get("bump"), sph.get("tex_shift"), getattr(a, "bump_rim", 0.0), mip)
+    caps = getattr(a, "caps", "proj")
+    capb = disc_build(sph["capb"].reshape(-1, 1, *sph["capb"].shape[-2:])) if caps == "disc" and sph.get("capb") is not None else None
+    tsh, tsg = sph.get("tex_shift"), sph.get("tex_sign")
+    args = (C, r, T, Bv, Nv, f, sph["s"], e, a.sig, a.tau_s, sph.get("disp"), sph["s_lo"], sph["s_len"], sph.get("bump"), tsh, getattr(a, "bump_rim", 0.0), mip,
+            tsg, caps, capb)
     outs = []
     for i in range(0, pix.shape[0], a.chunk):
         sl_ = slice(i, i + a.chunk)
@@ -1166,16 +1558,26 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     hb = torch.cat(outs, 1)  # (B, P, 8)
     wk, ck, nk, sl, ca, sa = hb[..., 0], hb[..., 1], hb[..., 2:5], hb[..., 5], hb[..., 6], hb[..., 7]
     tu = torch.atan2(sa, ca) / (2 * math.pi) % 1.0
-    tv = (sl - sph["s_lo"][obj]) / sph["s_len"][obj]
+    sal, cap, rho = cap_coords(sl, sph["s"][obj, -1], r[obj, 0], r[obj, -1], caps)
+    tv = (sal - sph["s_lo"][obj]) / sph["s_len"][obj]
+    wd = cap_weight(rho, cap) if caps == "disc" else None
     if mip is not None:
         fa_, fl_ = hb[..., 8], hb[..., 9] / sph["s_len"][obj]  # turns and texture lengths per pixel
         lev = lambda Ha_, Wl_: ((torch.log2(fa_ * Ha_) + mip["bias"]), (torch.log2(fl_ * (Wl_ - 1)) + mip["bias"]))
+    if wd is not None:  # where each cap's own texture is read: a disc around its pole, at a level by the larger footprint
+        re_ = torch.where(cap == 0, r[obj, 0], r[obj, -1])
+        tus_, tvs_ = sym_coords(tu, tv, obj[None].expand_as(tu), tsh, tsg)
+        flip = (tsg[obj, 1] < 0) if tsg is not None else torch.zeros_like(obj, dtype=torch.bool)
+        c_ = cap.clamp(min=0)
+        ci = obj * 2 + torch.where(flip, 1 - c_, c_)
+        xd, yd = 0.5 + 0.5 * rho * torch.cos(2 * math.pi * tus_), 0.5 + 0.5 * rho * torch.sin(2 * math.pi * tus_)
+        fpx = torch.maximum(hb[..., 10], hb[..., 9]) if mip is not None else torch.full_like(tu, 1.0 / zm)
+        dlev = lambda D_: torch.log2(fpx * D_ / (math.pi * re_)) + (mip["bias"] if mip is not None else 0.0)
     if clay is None:
         kb = obj[None].expand(B, -1)
-        tus, tvs = tu, tv
-        if "tex_shift" in sph:  # per body (turns about the spine, fraction along it): the texture turns and slides on the body
-            sh_ = sph["tex_shift"]
-            tus, tvs = (tu + sh_[obj, 0]) % 1.0, tv + sh_[obj, 1]
+        # per body: the texture turned about the spine and slid along it (tex_shift: turns, fraction), and
+        # mirrored around / reversed along (tex_sign: +-1)
+        tus, tvs = sym_coords(tu, tv, kb, tsh, tsg)
         lgt = tex_sample(tb.tex if tex is None else tex, kb, tus, tvs)
         if hasattr(tb, "tex0"):  # wrapped-still prior + learned residual
             t0_ = tb.tex0 if sub is None else tb.tex0[sub]
@@ -1183,6 +1585,10 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
                 lgt = lgt + rip_sample(rip_build(t0_), kb, tus, tvs, *lev(*t0_.shape[2:]))
             else:
                 lgt = lgt + tex_sample(t0_, kb, tus, tvs)
+        if wd is not None and hasattr(tb, "capt"):
+            ct_ = tb.capt if sub is None else tb.capt[sub]
+            lgd = disc_sample(disc_build(ct_.reshape(-1, *ct_.shape[2:])), ci, xd, yd, dlev(ct_.shape[-1]))
+            lgt = (1 - wd[..., None]) * lgt + wd[..., None] * lgd
         alb = torch.sigmoid(lgt)  # (B, P, 3)
         if "hue" in sph:  # per body, radians: turn the colour about the grey axis (YIQ), keeping its luminance
             hh = sph["hue"][obj]
@@ -1201,13 +1607,16 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         bm, rr_ = sph["bump"], int(getattr(a, "cav_r", 3))
         bp = torch.cat([bm[:, -rr_:], bm, bm[:, :rr_]], 1)[:, None]
         bb = F.avg_pool2d(F.pad(bp, (rr_, rr_, 0, 0), mode="replicate"), 2 * rr_ + 1, stride=1)[:, 0]
-        cu, cv = tu, tv
-        if "tex_shift" in sph:
-            cu, cv = (tu + sph["tex_shift"][obj, 0]) % 1.0, tv + sph["tex_shift"][obj, 1]
+        cu, cv = sym_coords(tu, tv, obj[None].expand(B, -1), tsh, tsg)
         if mip is not None:
             cav = rip_sample(rip_build(torch.relu(bb - bm)[:, None]), obj[None].expand(B, -1), cu, cv, *lev(*bm.shape[1:]))[..., 0]
         else:
             cav = tex_sample(torch.relu(bb - bm)[:, None], obj[None].expand(B, -1), cu, cv)[..., 0]  # (B, P)
+        if wd is not None and sph.get("capb") is not None:
+            cb_ = sph["capb"].reshape(-1, 1, *sph["capb"].shape[-2:])
+            cbb = F.avg_pool2d(F.pad(cb_, (rr_, rr_, rr_, rr_), mode="replicate"), 2 * rr_ + 1, stride=1)
+            cavd = disc_sample(disc_build(torch.relu(cbb - cb_)), ci, xd, yd, dlev(cb_.shape[-1]))[..., 0]
+            cav = (1 - wd) * cav + wd * cavd
     # ground: the plane z = 0 seen through every pixel
     yy, xx = torch.meshgrid((torch.arange(H, device=dev).float() - H / 2 + off[0]) / zm, (torch.arange(W, device=dev).float() - W / 2 + off[1]) / zm, indexing="ij")
     uu, vv = xx.reshape(-1), yy.reshape(-1)
@@ -1220,7 +1629,9 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     else:
         galb = torch.full((H * W, 3), 0.55 if ground == "flat" else 0.08, device=dev)
     if ground == "none":
-        wg = torch.full_like(wg, -1e4)
+        # nothing behind the bodies: the backdrop sits on the plane through the camera centre, facing it.
+        # (It once sat 1e4 px back, and a shadow tile holding one such pixel culled nothing right: squares.)
+        wg = torch.zeros_like(wg)
     # bodies: a soft z-buffer decides which body shows; together they cover the pixel with the union of
     # their coverages, and the ground shows through the rest (alpha over the ground)
     if getattr(a, "zbuf", "cover") == "cover":
@@ -1276,7 +1687,11 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     outs = []
     for bi in range(B):
         rg = as_rig(lights[bi if len(lights) > 1 else 0], a, dev)
-        l = rg["l"]
+        # cam.env: the lighting (key, ambient, sky) is fixed to the camera, not the world, so a view from
+        # below lights what it sees as the overhead light lights the tops
+        env = getattr(cam, "env", False)
+        l = R.T @ rg["l"] if env else rg["l"]
+        nenv = nc[bi] @ R.T if env else nc[bi]
         if blight is not None:
             lp = l[None] + comp[bi, :, 10:13]
             lp = lp / lp.norm(dim=-1, keepdim=True)
@@ -1290,9 +1705,9 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         hv = hv / hv.norm(dim=-1, keepdim=True)
         ndh = torch.relu((nc[bi] * hv).sum(-1))
         sh = rg["sh"] * getattr(a, "amb_scale", 1.0)
-        amb = (sh[0][None] + nc[bi, :, 0:1] * sh[1][None] + nc[bi, :, 1:2] * sh[2][None] + nc[bi, :, 2:3] * sh[3][None]).clamp(min=0)
+        amb = (sh[0][None] + nenv[:, 0:1] * sh[1][None] + nenv[:, 1:2] * sh[2][None] + nenv[:, 2:3] * sh[3][None]).clamp(min=0)
         a0 = sh[0].mean()
-        expo = (a0 + rg["dif"]) / (a0 + rg["dif"] * l[2])
+        expo = (a0 + rg["dif"]) / (a0 + rg["dif"] * rg["l"][2])
         tint = rg["tint"][None] * tp
         ao = (1 - occ[bi])[:, None]
         if cav is not None:
@@ -1303,6 +1718,9 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
             # darkens by the same rule from any camera, and it moves with the bodies
             sv, sw = 0, 0
             for d_ in sky_dirs(dev):
+                d_ = R.T @ d_ if env else d_
+                if env and abs(float(d_[2])) < 0.3:  # turned near the slab's plane: its rays run through the whole tiled pile
+                    continue
                 wgt = torch.relu((nc[bi] * d_).sum(-1))
                 v_ = shadow(Xc[bi], nc[bi], d_, {k_: (v_[bi:bi + 1] if k_ in ("C",) else v_) for k_, v_ in sph.items()}, S, cam.wrap, a.sky_pen0, a.sky_pen, H, W)
                 sv, sw = sv + wgt * v_, sw + wgt
@@ -1317,7 +1735,7 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
     img = img.clamp(0, 1)
     if not aux:
         return img
-    out = dict(img=img, ep=ep, den=den, pix=pix, obj=obj, alb=alb, nk=nk, ck=ck, tu=tu, tv=tv, gown=1 - cover, wc=wc)
+    out = dict(img=img, ep=ep, den=den, pix=pix, obj=obj, alb=alb, nk=nk, ck=ck, tu=tu, tv=tv, gown=1 - cover, wc=wc, cap=cap, rho=rho)
     if mip is not None:  # the footprint: turns around and texture lengths along, per output pixel
         out["fpa"], out["fpl"] = fa_, fl_
     if lab is not None:
@@ -1447,6 +1865,9 @@ def main():
     ap.add_argument("--tau-s", type=float, default=1.0, help="blend between the spheres of a body, px of depth")
     ap.add_argument("--tau-z", type=float, default=0.75, help="soft z-buffer between bodies, px of depth")
     ap.add_argument("--mip", type=int, default=0, help="filter textures and relief to each pixel's footprint (rip-maps)")
+    ap.add_argument("--caps", default="proj", choices=["proj", "disc"], help="end caps: the projected span (a pole where the around coordinate pinches) "
+                    "or geodesic span plus each cap's own disc texture toward its pole (objphys.py --caps disc converts a trained checkpoint)")
+    ap.add_argument("--cap-res", type=int, default=64, help="--caps disc: texels across a cap's paint disc (relief: half)")
     ap.add_argument("--mip-bias", type=float, default=0.0, help="--mip: log2 offset of the filter level (negative: sharper)")
     ap.add_argument("--zbuf", default="cover", choices=["cover", "key"], help="z-buffer: covering surfaces compete on depth (cover), or the old coverage-penalised depth (key)")
     ap.add_argument("--chunk", type=int, default=150000, help="pixel-body pairs per checkpointed chunk")
