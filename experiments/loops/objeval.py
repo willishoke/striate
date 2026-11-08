@@ -2,7 +2,9 @@
 turned t: every body's paint (and relief) turned t of the way round on its body, so what was underneath
 faces the camera. sym: every body rolled a random amount about its spine, and at random mirrored and/or
 reversed end for end (3 draws, mean; objphys --train-sym shows bodies this way). tilt: the camera 40 deg
-off vertical, 3 azimuths, mean. alias: mean |one sample - 4x4 supersampled| over the bodies at 1024 px.
+off vertical, 3 azimuths, mean. solo: 4 x 4 mosaics of lone bodies, each from a random direction (below the
+floor too) and roll, zoomed to fill its cell, the light turning with the camera (3 fixed draws, mean; as
+objphys --solo trains). alias: mean |one sample - 4x4 supersampled| over the bodies at 1024 px.
 usage: objeval.py outdir ckpt[:key=val,...] ...   (key=val overrides the checkpoint's render args, e.g. mip=1)
 """
 import os, sys, json, random, argparse
@@ -73,6 +75,22 @@ for spec in sys.argv[2:]:
             if d == 0:
                 u8(im[0]).save(f"{out}/{name}_tilt.png")
         r["tilt"] = float(np.mean(tl))
+        Cr_ = sp["C"][0]; cen_ = Cr_.mean(1)
+        reach_ = ((Cr_ - cen_[:, None]).norm(dim=-1) + sp["r"] * sp["f"].clamp(min=1)[:, None]).amax(1)
+        so = []
+        for d in range(3):
+            rr = random.Random(100 + d); G = 4; cell = 512 // G; tiles = []
+            for k in rr.sample(range(tb.K), G * G):
+                s1 = {n_: (None if v is None else v[:, [k]] if n_ in ("C", "T", "Bv") else v[[k]]) if torch.is_tensor(v) or v is None else v for n_, v in sp.items()}
+                Rm = rot_z(rr.uniform(0, 2 * np.pi)) @ rot_x(np.arccos(rr.uniform(-1, 1))) @ rot_z(rr.uniform(0, 2 * np.pi))
+                zm_ = min(2.0, max(0.6, 0.92 * cell / (2 * float(reach_[k]))))
+                cm = Cam(Rm, cell, cell, tuple(float(x) for x in cen_[k].tolist()), 512, wrap=False, zoom=zm_); cm.env = True
+                tiles.append(render(tb, s1, cm, build_pairs(s1, cm, 2.0), [rig()], ta, ground="none", sub=[k]))
+            im = torch.cat([torch.cat(tiles[i * G:(i + 1) * G], 3) for i in range(G)], 2)
+            so.append(score(im))
+            if d == 0:
+                u8(im[0]).save(f"{out}/{name}_solo.png")
+        r["solo"] = float(np.mean(so))
         pr2 = build_pairs(sp, cam2, 4.0)
         one = render(tb, sp, cam2, pr2, [rig()], ta, aux=True)
         acc = 0

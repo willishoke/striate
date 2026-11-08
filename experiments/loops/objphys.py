@@ -466,7 +466,11 @@ def main():
                     "(below too, floor hidden), the lighting turning with the camera")
     ap.add_argument("--sphere-cone", type=float, default=45.0, help="--view-sphere: degrees from straight down / straight up")
     ap.add_argument("--sphere-top", type=float, default=0.5, help="--view-sphere: share of those views from above (the rest from below)")
-    ap.add_argument("--train-rest", type=int, default=0, help="training: on the still's pose, frozen, instead of loop frames")
+    ap.add_argument("--train-rest", type=float, default=0, help="training: share of frames on the still's pose, frozen, instead of loop frames")
+    ap.add_argument("--solo", type=float, default=0.0, help="training: share of frames that are a mosaic of lone bodies (rest pose), "
+                    "each from a uniformly random direction and roll: the caps, flanks and bellies the pile hides, seen head-on")
+    ap.add_argument("--solo-grid", default="3,4", help="--solo: mosaic sizes (cells per side) drawn from; the bodies of a mosaic "
+                    "are of about one size, zoomed (0.6x to 2x) to fill their cells")
     ap.add_argument("--view-frac", type=float, default=0.0, help="training: fraction of frames seen through a tilted camera")
     ap.add_argument("--view-tilt", type=float, default=40.0, help="training: tilted camera, 10 to this many degrees off vertical, any azimuth")
     ap.add_argument("--also-trajs", help="training: comma-separated traj.pt files of other loops to train under as well")
@@ -858,6 +862,46 @@ def main():
             sp = dict(sp_rest)
             return sp
 
+        if a.solo > 0:  # each body's reach from its centroid (px), to pick the bodies a mosaic cell holds whole
+            Cr_ = sp_rest["C"][0]
+            cen_ = Cr_.mean(1)
+            reach_ = ((Cr_ - cen_[:, None]).norm(dim=-1) + sp_rest["r"] * sp_rest["f"].clamp(min=1)[:, None]).amax(1)
+            grids_ = [int(g_) for g_ in a.solo_grid.split(",")]
+
+        def solo_mosaic(lt_):
+            # G x G lone bodies of about one size, each turned to a uniformly random attitude (its belly up
+            # as often as its back) and set in its own cell, all drawn at once from straight above, zoomed
+            # so they fill their cells; the light keeps to the camera, so turning a body is as good as
+            # circling it. One frame for the network
+            G = rng.choice(grids_)
+            cell = S // G
+            order = reach_.argsort().tolist()
+            i0 = rng.randrange(0, tb.K - G * G + 1)
+            ks = order[i0:i0 + G * G]
+            rng.shuffle(ks)
+            zm_ = min(2.0, max(0.6, cell / (2.1 * float(reach_[ks].max()))))
+            cw = cell / zm_  # a cell in world px
+            s1 = {**sp_rest, **relief()}
+            s1 = {n_: (None if v is None else v[:, ks] if n_ in ("C", "T", "Bv") else v[ks]) if torch.is_tensor(v) or v is None else v
+                  for n_, v in s1.items()}
+            Rs, ps = [], []
+            for i, k in enumerate(ks):
+                Rm = rot_z(rng.uniform(0, 2 * math.pi)) @ rot_x(math.acos(rng.uniform(-1, 1))) @ rot_z(rng.uniform(0, 2 * math.pi))
+                Rs.append(torch.tensor(Rm, dtype=torch.float32, device=dev))
+                ps.append([(i % G + 0.5 - G / 2) * cw, (i // G + 0.5 - G / 2) * cw, 0.0])
+            Rs, ps = torch.stack(Rs), torch.tensor(ps, device=dev)
+            s1["C"] = torch.einsum("kij,bknj->bkni", Rs, s1["C"] - cen_[ks][None, :, None]) + ps[None, :, None]
+            s1["T"] = torch.einsum("kij,bknj->bkni", Rs, s1["T"])
+            s1["Bv"] = torch.einsum("kij,bknj->bkni", Rs, s1["Bv"])
+            cm = Cam(np.eye(3), G * cell, G * cell, (0.0, 0.0, 0.0), S, wrap=False, zoom=zm_)
+            cm.env = True
+            o = render(tb, s1, cm, padded(build_pairs(s1, cm, 2.0)), [lt_], ta, aux=True, ground="none", sub=ks)
+            own = o["ep"][0] / o["den"][0][o["pix"]]
+            Y = (o["alb"][0] * torch.tensor([0.299, 0.587, 0.114], device=dev)).sum(-1)
+            dark = (own * torch.relu(a.dark_floor - Y) ** 2).sum() / own.sum().clamp(min=1) / 0.01
+            img = F.pad(o["img"], (0, S - G * cell, 0, S - G * cell))
+            return img, dark
+
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
@@ -868,7 +912,7 @@ def main():
             js = [rng.randrange(len(pool)) for _ in range(a.mb)]
             ts = [rng.randrange(pool[j][0].shape[0]) for j in js]
             with torch.no_grad():
-                sps = [frame_sph(t, j) if not a.train_rest else rest_sph() for t, j in zip(ts, js)]
+                sps = [frame_sph(t, j) if rng.random() >= a.train_rest else rest_sph() for t, j in zip(ts, js)]
                 # some frames through a tilted camera, so the flanks and undersides the still never
                 # showed get trained too (a lifted or tilted body shows them)
                 cams = [top if rng.random() >= a.view_frac else
@@ -908,6 +952,15 @@ def main():
                     az_ = math.atan2(float(lt_["l"][1]), float(lt_["l"][0])) + math.radians(rng.uniform(-a.train_light, a.train_light))
                     el_ = math.asin(max(-1.0, min(1.0, float(lt_["l"][2])))) - math.radians(rng.uniform(0, a.train_light / 2))
                     lt_ = with_dir(lt_, az_, max(el_, math.radians(15)))
+                if a.solo > 0 and rng.random() < a.solo:
+                    img_, dk_ = solo_mosaic(lt_)
+                    acts.append(rg.act(MultiScaleCrop(224 / S, 512)(img_)))
+                    pens.append(a.wdark * dk_)
+                    ((-acts[-1] + acts[-1].detach().abs() * pens[-1]) / len(sps)).backward()
+                    acts[-1], pens[-1] = acts[-1].detach(), pens[-1].detach()
+                    if it == 0 or (it + 1) % 100 == 0:
+                        save(img_[0].detach(), f"{a.out}/solo_{it + 1:04d}.png")
+                    continue
                 if a.train_turn > 0:  # textures that hold up turned and slid on their bodies: paint all the way round
                     sp = dict(sp)
                     sp["tex_shift"] = torch.stack([(torch.rand(tb.K, device=dev) * 2 - 1) * a.train_turn,
