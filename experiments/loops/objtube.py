@@ -141,6 +141,36 @@ def seed_body(mask, S, nc, nr):
 
 # ---------------------------------------------------------------- bodies
 
+def spine_frame(C):
+    """Tangents T and the across-tube frame Bv (both (..., N, 3)) of spines C (..., N, 3): Bv is
+    parallel-transported along the spine from "up" at its start, so the around coordinate stays
+    defined where the spine climbs steeply."""
+    T = torch.cat([C[..., 1:2, :] - C[..., 0:1, :], C[..., 2:, :] - C[..., :-2, :], C[..., -1:, :] - C[..., -2:-1, :]], -2)
+    T = T / (T.norm(dim=-1, keepdim=True) + 1e-6)
+    zh = torch.tensor([0.0, 0.0, 1.0], device=C.device)
+    b0 = zh - T[..., 0, 2:3] * T[..., 0, :]
+    alt = torch.tensor([1.0, 0.0, 0.0], device=C.device) - T[..., 0, 0:1] * T[..., 0, :]
+    b0 = torch.where(b0.norm(dim=-1, keepdim=True) > 0.2, b0, alt)
+    Bs = [b0 / b0.norm(dim=-1, keepdim=True)]
+    for i in range(1, T.shape[-2]):
+        b = Bs[-1] - (Bs[-1] * T[..., i, :]).sum(-1, keepdim=True) * T[..., i, :]
+        Bs.append(b / (b.norm(dim=-1, keepdim=True) + 1e-6))
+    return T, torch.stack(Bs, -2)
+
+
+def kabsch(P, Q):
+    """Best-fit rotations R (..., 3, 3), uniform weights, taking the centred point sets P (..., N, 3)
+    onto the centred Q: R (p - mean p) ~ q - mean q. Solved in float64 on the CPU, without grad."""
+    with torch.no_grad():
+        P_, Q_ = P.detach().cpu().double(), Q.detach().cpu().double()
+        P_, Q_ = P_ - P_.mean(-2, keepdim=True), Q_ - Q_.mean(-2, keepdim=True)
+        U, _, Vh = torch.linalg.svd(P_.transpose(-1, -2) @ Q_)
+        d = torch.sign(torch.linalg.det(Vh.transpose(-1, -2) @ U.transpose(-1, -2)))
+        D = torch.diag_embed(torch.stack([torch.ones_like(d), torch.ones_like(d), d], -1))
+        R = Vh.transpose(-1, -2) @ D @ U.transpose(-1, -2)
+    return R.to(device=P.device, dtype=P.dtype)
+
+
 class Tubes(torch.nn.Module):
     def __init__(self, ctl, rad, a, dev):
         super().__init__()
@@ -199,7 +229,7 @@ class Tubes(torch.nn.Module):
         s = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], -1)  # (K, N), from the rest pose
         Lt = s[:, -1]
         r = r * (1 + 0.25 * torch.tanh(self.rip)[:, None] * torch.sin(2 * math.pi * self.ripf[:, None] * self.rip_u(s, Lt) + self.ripp[:, None]))
-        C = C[None]
+        C = C0 = C[None]
         if wob is not None:
             C = C + (wob if wob.dim() == 4 else wob[None])
         if jit is not None or yaw is not None:
@@ -212,19 +242,20 @@ class Tubes(torch.nn.Module):
                 C = torch.stack([mu[..., 0] + cy * dx - sy * dy, mu[..., 1] + sy * dx + cy * dy, C[..., 2]], -1)
             if jit is not None:
                 C = C + F.pad(jit, (0, 1))[:, :, None, :]
-        T = torch.cat([C[..., 1:2, :] - C[..., 0:1, :], C[..., 2:, :] - C[..., :-2, :], C[..., -1:, :] - C[..., -2:-1, :]], -2)
-        T = T / (T.norm(dim=-1, keepdim=True) + 1e-6)
-        # frame across the tube, parallel-transported along the spine from "up" at its start, so the
-        # around coordinate stays defined where the spine climbs steeply
-        zh = torch.tensor([0.0, 0.0, 1.0], device=C.device)
-        b0 = zh - T[..., 0, 2:3] * T[..., 0, :]
-        alt = torch.tensor([1.0, 0.0, 0.0], device=C.device) - T[..., 0, 0:1] * T[..., 0, :]
-        b0 = torch.where(b0.norm(dim=-1, keepdim=True) > 0.2, b0, alt)
-        Bs = [b0 / b0.norm(dim=-1, keepdim=True)]
-        for i in range(1, T.shape[-2]):
-            b = Bs[-1] - (Bs[-1] * T[..., i, :]).sum(-1, keepdim=True) * T[..., i, :]
-            Bs.append(b / (b.norm(dim=-1, keepdim=True) + 1e-6))
-        Bv = torch.stack(Bs, -2)
+        T, Bv = spine_frame(C)
+        if getattr(self.a, "frame", "transport") == "material" and C is not C0:
+            # the frame rides on the body: the rest pose's frame, turned by the body's best-fit rotation
+            # (Kabsch) and then by the least turn taking each rotated rest tangent onto the moved one
+            T0, B0 = spine_frame(C0)
+            R = kabsch(C0.expand_as(C), C)  # (B, K, 3, 3)
+            ta_, bv = torch.einsum("bkij,bknj->bkni", R, T0.expand_as(T)), torch.einsum("bkij,bknj->bkni", R, B0.expand_as(T))
+            ct = (ta_ * T).sum(-1, keepdim=True)
+            lt = bv - (bv * T).sum(-1, keepdim=True) / (1 + ct).clamp(min=1e-3) * (ta_ + T)
+            # where the moved spine has turned far from its rest direction (a crumpled end: cos < 0.5) the
+            # least turn nears its pole at cos = -1: there, fade to the plain projection of the turned frame
+            w = (ct / 0.5).clamp(0, 1)
+            bv = w * lt / (lt.norm(dim=-1, keepdim=True) + 1e-6) + (1 - w) * (bv - (bv * T).sum(-1, keepdim=True) * T)
+            Bv = bv / (bv.norm(dim=-1, keepdim=True) + 1e-6)
         s_lo, s_len = tex_span(s, r, self.a)
         out = dict(C=C, r=r, T=T, Bv=Bv, s=s, s_lo=s_lo, s_len=s_len, f=f,
                    disp=getattr(self.a, "disp_amp", 0.0) * torch.tanh(self.disp) if hasattr(self, "disp") else None,
@@ -1869,6 +1900,8 @@ def main():
                     "or geodesic span plus each cap's own disc texture toward its pole (objphys.py --caps disc converts a trained checkpoint)")
     ap.add_argument("--cap-res", type=int, default=64, help="--caps disc: texels across a cap's paint disc (relief: half)")
     ap.add_argument("--mip-bias", type=float, default=0.0, help="--mip: log2 offset of the filter level (negative: sharper)")
+    ap.add_argument("--frame", default="transport", choices=["transport", "material"], help="across-tube frame of a moved body: transported "
+                    "from world-up at its start (spins as the body tilts), or its rest frame turned with the body's best-fit rotation")
     ap.add_argument("--zbuf", default="cover", choices=["cover", "key"], help="z-buffer: covering surfaces compete on depth (cover), or the old coverage-penalised depth (key)")
     ap.add_argument("--chunk", type=int, default=150000, help="pixel-body pairs per checkpointed chunk")
     ap.add_argument("--pen0", type=float, default=0.6)
