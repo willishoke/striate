@@ -1,6 +1,8 @@
 """Rest and turned scores, edge noise, and crops for objtube.py checkpoints.
 turned t: every body's paint (and relief) turned t of the way round on its body, so what was underneath
-faces the camera. alias: mean |one sample - 4x4 supersampled| over the bodies at 1024 px.
+faces the camera. sym: every body rolled a random amount about its spine, and at random mirrored and/or
+reversed end for end (3 draws, mean; objphys --train-sym shows bodies this way). tilt: the camera 40 deg
+off vertical, 3 azimuths, mean. alias: mean |one sample - 4x4 supersampled| over the bodies at 1024 px.
 usage: objeval.py outdir ckpt[:key=val,...] ...   (key=val overrides the checkpoint's render args, e.g. mip=1)
 """
 import os, sys, json, random, argparse
@@ -11,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np, torch
 import torch.nn.functional as F
 from PIL import Image
-from objtube import Mixed, Rig, Cam, build_pairs, render
+from objtube import Mixed, Rig, Cam, build_pairs, render, rot_x, rot_z
 from striate.util import pick_device
 from striate.model import Backbone
 from zoo import MultiScaleCrop
@@ -34,7 +36,7 @@ for spec in sys.argv[2:]:
     ck = torch.load(path, map_location="cpu", weights_only=False)
     ta = argparse.Namespace(**ck["args"])
     for kv in (ov[0].split(",") if ov else []):
-        k, v = kv.split("="); setattr(ta, k, float(v))
+        k, v = kv.split("="); setattr(ta, k, int(v) if v.isdigit() else float(v))
     tb = Mixed.from_state(ck["tubes"], ta, dev); rig = Rig(0., .8, ta, dev); rig.load_state_dict(ck["rig"])
     r = {}
     with torch.no_grad():
@@ -51,6 +53,26 @@ for spec in sys.argv[2:]:
             r[f"turn{t}"] = score(im)
             if t in (0.0, 0.5):
                 u8(im[0]).save(f"{out}/{name}_t{t}.png")
+        ss = lambda s_, cm, pr_: sum(render(tb, s_, cm, pr_, [rig()], ta, off=(oy, ox)) for oy in (-0.25, 0.25) for ox in (-0.25, 0.25)) / 4
+        sy = []
+        for d in range(3):
+            g = torch.Generator().manual_seed(d)
+            s_ = dict(sp)
+            s_["tex_shift"] = torch.stack([torch.rand(tb.K, generator=g), torch.zeros(tb.K)], -1).to(dev)
+            s_["tex_sign"] = torch.where(torch.rand(tb.K, 2, generator=g) < 0.5, -1.0, 1.0).to(dev)
+            im = ss(s_, top, pr)
+            sy.append(score(im))
+            if d == 0:
+                u8(im[0]).save(f"{out}/{name}_sym.png")
+        r["sym"] = float(np.mean(sy))
+        tl = []
+        for d, az in enumerate((0.3, 2.4, 4.5)):
+            cm = Cam(rot_x(np.radians(40)) @ rot_z(az), 512, 512, (256, 256, 0.), 512)
+            im = ss(sp, cm, build_pairs(sp, cm, 4.0))
+            tl.append(score(im))
+            if d == 0:
+                u8(im[0]).save(f"{out}/{name}_tilt.png")
+        r["tilt"] = float(np.mean(tl))
         pr2 = build_pairs(sp, cam2, 4.0)
         one = render(tb, sp, cam2, pr2, [rig()], ta, aux=True)
         acc = 0
