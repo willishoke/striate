@@ -479,6 +479,8 @@ def main():
     ap.add_argument("--wrim", type=float, default=1.0, help="training: cost of texture darkening toward a body's limb")
     ap.add_argument("--wdark", type=float, default=1.0, help="training: cost of texture darker than --dark-floor")
     ap.add_argument("--dark-floor", type=float, default=0.15)
+    ap.add_argument("--wmatch", type=float, default=0.0, help="training: on frames seen from below, each body's paint luminance (mean, std, "
+                    "quantiles: objunder.py) must match its own top's, from the rest pose seen from above")
     ap.add_argument("--ao-dif", type=float, default=None, help="share of the occlusion applied to the key light (default: the checkpoint's)")
     ap.add_argument("--amb-scale", type=float, default=None, help="scale the rig's ambient (default: the checkpoint's)")
     ap.add_argument("--sky", type=float, default=None, help="objtube's 3D sky occlusion strength (default: the checkpoint's)")
@@ -494,6 +496,8 @@ def main():
     ap.add_argument("--cavity", type=float, default=None, help="pits in the fine relief darken by exp(-this * depth px) (default: the checkpoint's)")
     ap.add_argument("--cav-r", type=int, default=3)
     ap.add_argument("--train-light", type=float, default=0.0, help="training: each sample's key light turns up to this many degrees in azimuth and drops up to half of it in elevation, so shading painted for one light fails the rest")
+    ap.add_argument("--hero-theta", type=float, default=0.0, help="render: the loop through a camera turned this many degrees about x "
+                    "round the pile's mid-height (180: from below, through the floor), the lights turning with it, dark backdrop")
     ap.add_argument("--light-swing", type=float, default=0.0, help="render: the key light swings this many degrees in azimuth (and a quarter of it in elevation) over the loop")
     ap.add_argument("--bump-rim", type=float, default=None, help="relief displacement fades toward the outline (default: the checkpoint's)")
     ap.add_argument("--mip", type=int, default=None, help="filter textures and relief to each pixel's footprint (objtube.py --mip; default: the checkpoint's)")
@@ -886,6 +890,17 @@ def main():
             sp_rest = tb.spheres()
             zmid = float(sp_rest["C"][0][..., 2].mean())
 
+        if a.wmatch > 0:  # each body's top at rest, seen from above: what its underside's paint must match
+            from objunder import body_lum_stats, lum
+            with torch.no_grad():
+                cm_ = Cam(np.eye(3), S, S, (S / 2, S / 2, zmid), S)
+                cm_.env = True
+                o = render(tb, sp_rest, cm_, padded(build_pairs(sp_rest, cm_, 4.0)), [rig()], ta, aux=True, ground="none")
+                own_ = o["ep"][0] / o["den"][0][o["pix"]]
+                mt_, Wt_ = body_lum_stats(lum(o["alb"][0]), own_, o["obj"], tb.K)
+                del o
+            log(f"match: tops of {int((Wt_ > 30).sum())} bodies seen at rest; mean luminance {float(mt_[Wt_ > 30, 0].mean()):.3f}")
+
         def rest_sph():  # the still's pose, frozen: what --train-rest trains on
             sp = dict(sp_rest)
             return sp
@@ -933,6 +948,7 @@ def main():
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
+        mlog = []  # --wmatch: the match term of each frame from below, between log lines
         log(f"training textures under the loop: {a.train} steps, {a.mb} frames each")
         for it in range(a.train):
             for g, b in zip(opt.param_groups, base):
@@ -1022,6 +1038,12 @@ def main():
                 rim = (band * torch.relu(0.75 * refY.detach()[obj] - Y) ** 2).sum() / band.sum().clamp(min=1) / 0.01
                 dark = (own * torch.relu(a.dark_floor - Y) ** 2).sum() / own.sum().clamp(min=1) / 0.01
                 pens.append(a.wrim * rim + a.wdark * dark)
+                if a.wmatch > 0 and getattr(cm, "env", False) and cm.R[2, 2] < 0:  # seen from below: undersides as their tops
+                    mb_, Wb_ = body_lum_stats(Y, own, obj, tb.K)
+                    ok_ = (Wt_ > 30).float() * (Wb_ / 500).clamp(max=1)  # a glimpse of a body counts for less
+                    match = (ok_ * (mb_ - mt_).pow(2).sum(-1)).sum() / ok_.sum().clamp(min=1) / 0.01
+                    pens[-1] = pens[-1] + a.wmatch * match
+                    mlog.append(float(match))
                 # each frame's graph is freed as soon as it is used (two at once ran out of memory)
                 ((-acts[-1] + acts[-1].detach().abs() * pens[-1]) / len(sps)).backward()
                 acts[-1], pens[-1] = acts[-1].detach(), pens[-1].detach()
@@ -1044,7 +1066,9 @@ def main():
                 skp.backward(tb.tex0.grad, tb.bump.grad)
             opt.step()
             if it % 25 == 0 or it == a.train - 1:
-                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + (f" kl {float(kl_):.3f}" if skp is not None else "") + f" (frames {ts})")
+                log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + (f" kl {float(kl_):.3f}" if skp is not None else "")
+                    + (f" match {np.mean(mlog):.3f}" if mlog else "") + f" (frames {ts})")
+                mlog = []
                 if str(dev).startswith("mps"):
                     torch.mps.empty_cache()
             if (it + 1) % 100 == 0 and it + 1 < a.train:  # a crash late in a run keeps most of it
@@ -1082,6 +1106,11 @@ def main():
             acts, gnd = [], []
             Z = int(round(a.zoom * S))  # output size: --zoom 2 renders the same view at 1024 px
             camR = Cam(np.eye(3), Z, Z, (S / 2, S / 2, 0.0), S, zoom=a.zoom)
+            gk = {}
+            if a.hero_theta:  # turned round the pile's middle; the lights turn with it, nothing behind the bodies
+                camR = Cam(rot_x(math.radians(a.hero_theta)), Z, Z, (S / 2, S / 2, float(sp["C"][0][..., 2].mean())), S, zoom=a.zoom)
+                camR.env = True
+                gk = dict(ground="none")
             down = (lambda x: F.interpolate(x, size=(S, S), mode="area")) if Z != S else (lambda x: x)
             ref0 = ref
             az0 = math.atan2(float(ref0["l"][1]), float(ref0["l"][0]))
@@ -1093,10 +1122,10 @@ def main():
                     ref = with_dir(ref0, az0 + sw * math.sin(ph), min(max(el0 + sw / 4 * math.sin(2 * ph), math.radians(10)), math.radians(85)))
                 sp = frame_sph(t)
                 pr = padded(build_pairs(sp, camR, 4.0))
-                fr = render_ss(tb, sp, camR, pr, ref, ta) if a.ss else render(tb, sp, camR, pr, [ref], ta)
+                fr = render_ss(tb, sp, camR, pr, ref, ta, **gk) if a.ss else render(tb, sp, camR, pr, [ref], ta, **gk)
                 acts.append(score(down(fr)))
                 save(fr[0], f"{d}/f{t:04d}.png")
-                o = render(tb, sp, camR, pr, [ref], ta, clay=0.72, aux=True)
+                o = render(tb, sp, camR, pr, [ref], ta, clay=0.72, aux=True, **gk)
                 gnd.append(float(o["gown"].mean()))
                 if a.idmaps:  # which body shows at each pixel (255: the ground), for recolouring in the browser
                     ep_, pix_, obj_ = o["ep"][0], o["pix"], o["obj"]
