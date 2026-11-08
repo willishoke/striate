@@ -64,8 +64,9 @@ def radius_along(s, r, s_lo, s_len, Wl):
     return rr, sg
 
 
-def charts(s, r, s_lo, s_len, Wl, delta=0.5, alpha=0.5, mult=16):
-    """Per body: (Hc, Wc, c (Wl,) canvas column of each unwrap column, r_ref). Lists of python/tensors."""
+def charts(s, r, s_lo, s_len, Wl, delta=0.5, alpha=0.5, mult=16, wmult=16):
+    """Per body: (Hc, Wc, c (Wl,) canvas column of each unwrap column, r_ref). Lists of python/tensors. Hc is a
+    multiple of mult, Wc of wmult (fewer distinct canvas shapes: MPS keeps buffers and graphs per shape)."""
     rr, sg = radius_along(s, r, s_lo, s_len, Wl)
     out = []
     for k in range(s.shape[0]):
@@ -76,7 +77,7 @@ def charts(s, r, s_lo, s_len, Wl, delta=0.5, alpha=0.5, mult=16):
         rref = Hc * delta / (2 * math.pi)  # the period is what the rounding made it
         dcol = float(s_len[k]) / (Wl - 1) / delta * (rref / rr[k]) ** alpha
         c = torch.cat([torch.zeros(1, device=s.device), torch.cumsum(0.5 * (dcol[1:] + dcol[:-1]), 0)])
-        Wc = int(math.ceil((float(c[-1]) + 1) / mult)) * mult
+        Wc = int(math.ceil((float(c[-1]) + 1) / wmult)) * wmult
         c = c + (Wc - 1 - float(c[-1])) / 2
         out.append((Hc, Wc, c, rref))
     return out
@@ -214,7 +215,7 @@ class SkinPrior(nn.Module):
     def init(self, logit, bump, sph):
         K, _, Ha, Wl = logit.shape
         self.Ha, self.Wl, self.Hb, self.Wb = Ha, Wl, bump.shape[1], bump.shape[2]
-        self.ch = charts(sph["s"], sph["r"], sph["s_lo"], sph["s_len"], Wl, self.delta, self.alpha)
+        self.ch = charts(sph["s"], sph["r"], sph["s_lo"], sph["s_len"], Wl, self.delta, self.alpha, wmult=64)
         jb = torch.linspace(0, Wl - 1, self.Wb, device=logit.device)
         self.cb = []
         PConv.wrap = True
@@ -239,7 +240,13 @@ class SkinPrior(nn.Module):
 
     def decode(self):
         t, b = zip(*[self.decode_k(k) for k in range(len(self.ch))])
-        return torch.stack(t), torch.stack(b)
+        out = torch.stack(t), torch.stack(b)
+        self._flush()
+        return out
+
+    def _flush(self):  # the canvases come in dozens of shapes: hand their cached buffers back every step
+        if str(self.dev).startswith("mps"):
+            torch.mps.empty_cache()
 
     def backward(self, gt, gb):
         """Push the gradients on the decoded tex0 (K, 3, Ha, Wl) and bump (K, Hb, Wb) (either None) into the
@@ -253,6 +260,7 @@ class SkinPrior(nn.Module):
                 tot = tot + (b * gb[k]).sum()
             if torch.is_tensor(tot):
                 tot.backward()
+        self._flush()
 
     def kl(self):
         if self.vae.nq:  # VQ: the commitment, how far the latents sit from their codes
