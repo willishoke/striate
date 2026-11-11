@@ -1638,7 +1638,7 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         # per body: the texture turned about the spine and slid along it (tex_shift: turns, fraction), and
         # mirrored around / reversed along (tex_sign: +-1)
         tus, tvs = sym_coords(tu, tv, kb, tsh, tsg)
-        lgt = tex_sample(tb.tex if tex is None else tex, kb, tus, tvs)
+        lgt = tex_sample((tb.tex if sub is None else tb.tex[sub]) if tex is None else tex, kb, tus, tvs)
         if hasattr(tb, "tex0"):  # wrapped-still prior + learned residual
             t0_ = tb.tex0 if sub is None else tb.tex0[sub]
             if mip is not None:
