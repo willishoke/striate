@@ -512,8 +512,9 @@ def main():
     ap.add_argument("--fill-fp", type=float, default=4.0, help="--spec-fill: seen = at most this many texels per still pixel at rest")
     ap.add_argument("--tile-init", type=int, default=0, help="start each body's skin as its top (what faces up at rest) repeated this many times round it (3)")
     ap.add_argument("--cap-res", type=int, default=64, help="--caps disc: texels across a cap's paint disc (relief: half)")
-    ap.add_argument("--frame", default=None, choices=["transport", "material"], help="across-tube frame of a moved body (objtube.py --frame; "
+    ap.add_argument("--frame", default=None, choices=["transport", "material", "smooth"], help="across-tube frame of a moved body (objtube.py --frame; "
                     "default: the checkpoint's, else transport)")
+    ap.add_argument("--frame-width", type=float, default=None, help="--frame smooth: the spine's low-pass sigma, in local tube radii (default 1.0)")
     ap.add_argument("--wskin", type=float, default=0.0, help="training: the skin a camera never saw sharply (finer than --skin-fp) "
                     "must match the pattern statistics (Gram matrices of --skin-layers) of the skin it did, body by body")
     ap.add_argument("--skin-fp", type=float, default=2.0, help="--wskin: seen sharply = at most this many texels per still pixel at rest")
@@ -559,6 +560,9 @@ def main():
     if a.frame is not None:
         ta.frame = a.frame
         ck["args"] = {**ck["args"], "frame": a.frame}
+    if a.frame_width is not None:
+        ta.frame_width = a.frame_width
+        ck["args"] = {**ck["args"], "frame_width": a.frame_width}
     if a.cavity is not None:
         ta.cavity, ta.cav_r = a.cavity, a.cav_r
         ck["args"] = {**ck["args"], "cavity": a.cavity, "cav_r": a.cav_r}
@@ -796,11 +800,12 @@ def main():
         # material coordinates: arclength along the moved spine, caps from the moved radii, so the
         # texture stretches with the body instead of sliding, and a swollen cap doesn't run past the
         # end of the texture (which clamps into streaks)
-        C = sp["C"][0]
-        seg = (C[:, 1:] - C[:, :-1]).norm(dim=-1)
-        s = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], -1)
-        sp["s"] = s
-        sp["s_lo"], sp["s_len"] = tex_span(s, r, ta)
+        # (--frame smooth: spheres already gave the arclength of the low-passed texture spine)
+        if getattr(ta, "frame", "transport") != "smooth":
+            C = sp["C"][0]
+            seg = (C[:, 1:] - C[:, :-1]).norm(dim=-1)
+            sp["s"] = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], -1)
+        sp["s_lo"], sp["s_len"] = tex_span(sp["s"], r, ta)
         if hue_w is not None:
             sp["hue"] = hue_w[t % T_]
         if tex_w is not None:

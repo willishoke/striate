@@ -171,6 +171,27 @@ def kabsch(P, Q):
     return R.to(device=P.device, dtype=P.dtype)
 
 
+def smooth_spine(C0, C, r, width):
+    """Texture spine of moved spines C (B, K, N, 3) from the rest spines C0 (1, K, N, 3), radii r (K, N):
+    the rest spine in the body's best-fit rigid pose, plus the moved spine's residual from it low-passed
+    along the arclength (local-linear Gaussian, so the ends don't lag; sigma = width x local radius).
+    Bends longer than a radius carry through; the sim's sphere-to-sphere jitter (crumpling a fat body's
+    tangents, and so its texture coordinates) does not."""
+    R = kabsch(C0.expand_as(C), C)
+    m0, m = C0.mean(-2, keepdim=True), C.mean(-2, keepdim=True)
+    rig = torch.einsum("bkij,bknj->bkni", R, (C0 - m0).expand_as(C)) + m
+    d = C - rig
+    seg = (C0[0, :, 1:] - C0[0, :, :-1]).norm(dim=-1)
+    s = torch.cat([torch.zeros_like(seg[:, :1]), seg.cumsum(-1)], -1)
+    ds = s[:, None, :] - s[:, :, None]  # (K, i, j): s_j - s_i
+    w = torch.exp(-0.5 * (ds / (width * r).clamp(min=1e-3)[:, :, None]) ** 2)
+    S0, S1, S2 = w.sum(-1), (w * ds).sum(-1), (w * ds * ds).sum(-1)
+    M0, M1 = torch.einsum("kij,bkjd->bkid", w, d), torch.einsum("kij,bkjd->bkid", w * ds, d)
+    den = S0 * S2 - S1 * S1
+    ll = (S2[..., None] * M0 - S1[..., None] * M1) / den.clamp(min=1e-9)[..., None]
+    return rig + torch.where((den > 1e-6 * S0 * S0)[..., None], ll, M0 / S0[..., None])
+
+
 class Tubes(torch.nn.Module):
     def __init__(self, ctl, rad, a, dev):
         super().__init__()
@@ -243,7 +264,15 @@ class Tubes(torch.nn.Module):
             if jit is not None:
                 C = C + F.pad(jit, (0, 1))[:, :, None, :]
         T, Bv = spine_frame(C)
-        if getattr(self.a, "frame", "transport") == "material" and C is not C0:
+        if getattr(self.a, "frame", "transport") == "smooth" and C is not C0:
+            # the texture's tangents and arclength from the smoothed spine (smooth_spine); the spheres stay
+            # where they are, and the frame then rides on the body as with "material"
+            Cs = smooth_spine(C0, C, r.detach(), getattr(self.a, "frame_width", 1.0))
+            T, Bv = spine_frame(Cs)
+            if Cs.shape[0] == 1:  # (a batch of poses keeps the rest arclength)
+                seg_ = (Cs[0, :, 1:] - Cs[0, :, :-1]).norm(dim=-1)
+                s = torch.cat([torch.zeros_like(seg_[:, :1]), seg_.cumsum(-1)], -1)
+        if getattr(self.a, "frame", "transport") in ("material", "smooth") and C is not C0:
             # the frame rides on the body: the rest pose's frame, turned by the body's best-fit rotation
             # (Kabsch) and then by the least turn taking each rotated rest tangent onto the moved one
             T0, B0 = spine_frame(C0)
@@ -1900,8 +1929,9 @@ def main():
                     "or geodesic span plus each cap's own disc texture toward its pole (objphys.py --caps disc converts a trained checkpoint)")
     ap.add_argument("--cap-res", type=int, default=64, help="--caps disc: texels across a cap's paint disc (relief: half)")
     ap.add_argument("--mip-bias", type=float, default=0.0, help="--mip: log2 offset of the filter level (negative: sharper)")
-    ap.add_argument("--frame", default="transport", choices=["transport", "material"], help="across-tube frame of a moved body: transported "
-                    "from world-up at its start (spins as the body tilts), or its rest frame turned with the body's best-fit rotation")
+    ap.add_argument("--frame", default="transport", choices=["transport", "material", "smooth"], help="across-tube frame of a moved body: transported "
+                    "from world-up at its start (spins as the body tilts), or its rest frame turned with the body's best-fit rotation; smooth: that, "
+                    "on a spine whose sphere-to-sphere jitter is low-passed (smooth_spine)")
     ap.add_argument("--zbuf", default="cover", choices=["cover", "key"], help="z-buffer: covering surfaces compete on depth (cover), or the old coverage-penalised depth (key)")
     ap.add_argument("--chunk", type=int, default=150000, help="pixel-body pairs per checkpointed chunk")
     ap.add_argument("--pen0", type=float, default=0.6)
