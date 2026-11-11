@@ -276,8 +276,9 @@ def select(z, pix, per, R, log=print):
         conf = len(det) / len(elig) if len(elig) else 0.0
         G.append(dict(mem=mem, views=vs, px=px, f=f, maj=maj, elig=len(elig), det=len(det), conf=conf,
                       score=float(np.mean(score[mem])), levels=np.bincount(V[vs, 1].astype(int), minlength=LEVELS)))
-    # 3. containment forest over the majority masks; bottom-up whole-vs-parts choice
-    i, j, inter, area = overlaps([g["maj"] for g in G], R * R)
+    # 3. containment forest over the 2/3 cores (the label rule), so a neighbour that takes an object in
+    # only some of its views does not swallow it; bottom-up whole-vs-parts choice
+    i, j, inter, area = overlaps([g["px"][g["f"] >= 2 / 3] for g in G], R * R)
     parent = -np.ones(len(G), int)
     for a, b, x in zip(i, j, inter):  # b inside a?
         if a != b and area[b] < area[a] and x >= 0.8 * area[b]:
@@ -301,7 +302,7 @@ def select(z, pix, per, R, log=print):
         m = G[u]["maj"]
         if taken[m].mean() > 0.5:
             continue
-        taken[m] = True
+        taken[G[u]["px"][G[u]["f"] >= 2 / 3]] = True  # its core, as in step 3
         acc.append(G[u])
     log(f"{len(G)} groups with a majority mask, {len(sel)} selected, {len(acc)} accepted")
     return acc, G
