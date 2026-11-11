@@ -1577,9 +1577,10 @@ def body_hits(X0, obj, C, r, T, Bv, Nv, f, s, e, sig, tau_s, disp=None, s_lo=Non
     return torch.cat(out, -1)
 
 
-def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex", off=(0.0, 0.0), aux=False, lab=None, tex=None, blight=None, sub=None):
+def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex", off=(0.0, 0.0), aux=False, lab=None, tex=None, blight=None, sub=None, burn=None):
     """Lit frames (B, 3, H, W). clay: grey albedo instead of the textures. ground: 'tex' (learned, on
-    the torus), 'flat' (plain grey plane at z = 0) or 'none' (dark backdrop)."""
+    the torus), 'flat' (plain grey plane at z = 0) or 'none' (dark backdrop). burn: the dodge-and-burn
+    layer's values (BurnLayer()), else the args' (--burn ...; burn_args)."""
     dev = tb.dev
     H, W, S = cam.H, cam.W, cam.S
     R = torch.tensor(cam.R, dtype=torch.float32, device=dev)
@@ -1744,7 +1745,7 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
             bl = F.avg_pool2d(F.pad(d, (rr, rr, rr, rr), mode="circular" if top_down else "replicate"), 2 * rr + 1, stride=1)
             acc = acc + torch.relu(bl - d) / rr
         occ = (1 - torch.exp(-a.ao * acc)).reshape(B, H * W)
-    outs = []
+    outs, lvec, skys = [], [], []
     for bi in range(B):
         rg = as_rig(lights[bi if len(lights) > 1 else 0], a, dev)
         # cam.env: the lighting (key, ambient, sky) is fixed to the camera, not the world, so a view from
@@ -1786,16 +1787,31 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
                 sv, sw = sv + wgt * v_, sw + wgt
             sky = (sv / sw.clamp(min=1e-3))[:, None]
             ao = ao * (1 - a.sky * (1 - sky))
+            skys.append(sky[:, 0].detach())
+        lvec.append(l.detach())
         col = albc[bi] * (amb * ao + rg["dif"] * tint * (ndl * vis)[:, None] * (1 - getattr(a, "ao_dif", 0.5) * (1 - ao))) * expo \
             + rg["spec"] * tint * (ndh ** rg["shin"] * vis * (ndl > 0))[:, None] * ao
         outs.append(col.T.reshape(3, H, W))
     img = torch.stack(outs)
     if getattr(a, "outline", 0.0) > 0:
         img = img * (1 - a.outline * outline_band(ep, pix, obj, B, H, W, a.outline_w, cam.wrap and np.allclose(cam.R, np.eye(3))))[:, None]
+    bn = burn if burn is not None else burn_args(a)
+    dist = None
+    if bn is not None:
+        # dodge and burn: not a light, a drawn layer on the lit frame, from each frame's own silhouettes
+        # (and depth), so it follows the bodies and can be retuned at render time
+        top_down = cam.wrap and np.allclose(cam.R, np.eye(3))
+        reach = max(float(bn["burn_w"]) * 4, float(bn["dodge_r"]) + 2.5 * float(bn["dodge_w"]))
+        dist = outline_dist(ep, pix, obj, B, H, W, int(math.ceil(min(reach, 20.0) * zm)), top_down, cover)
+        img = burn_layer(img, dist / zm, bn, wc.reshape(B, 1, H, W) if float(bn["crease"]) > 0 else None, zm, top_down)
     img = img.clamp(0, 1)
     if not aux:
         return img
-    out = dict(img=img, ep=ep, den=den, pix=pix, obj=obj, alb=alb, nk=nk, ck=ck, tu=tu, tv=tv, gown=1 - cover, wc=wc, cap=cap, rho=rho)
+    out = dict(img=img, ep=ep, den=den, pix=pix, obj=obj, alb=alb, nk=nk, ck=ck, tu=tu, tv=tv, gown=1 - cover, wc=wc, cap=cap, rho=rho, lvec=torch.stack(lvec))
+    if dist is not None:  # screen px from the nearest outline
+        out["dist"] = dist
+    if skys:  # the share of the sky each pixel sees
+        out["sky"] = torch.stack(skys)
     if mip is not None:  # the footprint: turns around and texture lengths along, per output pixel
         out["fpa"], out["fpl"] = fa_, fl_
     if lab is not None:
@@ -1836,6 +1852,123 @@ def outline_band(ep, pix, obj, B, H, W, w, wrap):
             band = torch.maximum(band, d * math.exp(-i / w))
         out.append(band)
     return torch.stack(out)
+
+
+@torch.no_grad()
+def outline_dist(ep, pix, obj, B, H, W, dmax, wrap, cover=None):
+    """(B, H * W): screen px from each pixel to the nearest pixel on a boundary between owners (owner =
+    the pair with the largest weight; the ground owns what no pair covers by half), 0 on it, at most dmax. Grown
+    by alternating 3x3 square and cross dilations (an octagonal metric), so it costs dmax small pools."""
+    out = []
+    mode = "circular" if wrap else "replicate"
+    for b in range(B):
+        best = torch.full((H * W,), -1.0, device=ep.device).scatter_reduce(0, pix, ep[b], "amax", include_self=True)
+        win = (ep[b] >= best[pix] - 1e-12) & (ep[b] > 1e-6)
+        idm = torch.full((H * W,), -1.0, device=ep.device)
+        idm[pix[win]] = obj[win].float()
+        if cover is not None:
+            idm[cover[b] < 0.5] = -1.0
+        p = F.pad(idm.reshape(1, 1, H, W), (1, 1, 1, 1), mode=mode)[0, 0]
+        c = p[1:-1, 1:-1]
+        E = ((c != p[:-2, 1:-1]) | (c != p[2:, 1:-1]) | (c != p[1:-1, :-2]) | (c != p[1:-1, 2:])).float()[None, None]
+        d = torch.where(E[0, 0] > 0, 0.0, float(dmax))
+        for i in range(1, dmax):
+            q = F.pad(E, (1, 1, 1, 1), mode=mode)
+            E = F.max_pool2d(q, 3, stride=1) if i % 2 else torch.maximum(F.max_pool2d(q[..., 1:-1], (3, 1), stride=1), F.max_pool2d(q[..., 1:-1, :], (1, 3), stride=1))
+            d = torch.where((E[0, 0] > 0) & (d >= dmax), float(i), d)
+        out.append(d.reshape(-1))
+    return torch.stack(out)
+
+
+BURN_KEYS = ("burn", "burn_w", "dodge", "dodge_r", "dodge_w", "crease")
+
+
+def burn_args(a):
+    """The dodge-and-burn layer's values from args (--burn ...), or None when it is off."""
+    v = {k: float(getattr(a, k, 0.0) or 0.0) for k in BURN_KEYS}
+    if v["burn"] <= 0 and v["dodge"] <= 0 and v["crease"] <= 0:
+        return None
+    v["burn_w"] = v["burn_w"] or 1.5
+    v["dodge_r"] = v["dodge_r"] or 2.5
+    v["dodge_w"] = v["dodge_w"] or 1.0
+    return v
+
+
+def burn_layer(img, d, bn, wc, zm, wrap):
+    """The non-physical shading of the projected outlines, on a lit frame img (B, 3, H, W); d (B, H * W):
+    world px from the nearest outline. burn: darken by burn * exp(-d / burn_w) (both sides of every
+    outline: a dark seam). dodge: lighten (screen) a ring dodge_r px from it, dodge_w wide. crease:
+    darken by exp(-crease * depth below the surroundings), from the composited depth wc (B, 1, H, W)."""
+    B, _, H, W = img.shape
+    d = d.reshape(B, 1, H, W)
+    img = img * (1 - bn["burn"] * torch.exp(-d / bn["burn_w"]))
+    if float(bn["dodge"]) > 0:
+        ring = bn["dodge"] * torch.exp(-((d - bn["dodge_r"]) / bn["dodge_w"]) ** 2)
+        img = img + ring * (1 - img.clamp(max=1))
+    if wc is not None:
+        acc = 0
+        for rr in [max(1, int(round(q * zm))) for q in (3, 6, 12)]:
+            bl = F.avg_pool2d(F.pad(wc.detach(), (rr, rr, rr, rr), mode="circular" if wrap else "replicate"), 2 * rr + 1, stride=1)
+            acc = acc + torch.relu(bl - wc.detach()) / (rr / zm)
+        img = img * torch.exp(-bn["crease"] * acc)
+    return img
+
+
+class BurnLayer(torch.nn.Module):
+    """The dodge-and-burn layer's values as bounded parameters (a few global scalars), trainable with the
+    textures. A component that starts at 0 (burn, dodge, crease) stays off."""
+    BOUNDS = dict(burn=(0.0, 0.8), burn_w=(0.3, 4.3), dodge=(0.0, 0.5), dodge_r=(0.5, 5.5), dodge_w=(0.3, 3.3), crease=(0.0, 2.0))
+
+    def __init__(self, v, dev):
+        super().__init__()
+        self.on = {k: (float(v[k]) > 0 if k in ("burn", "dodge", "crease") else True) for k in BURN_KEYS}
+        lgt = lambda x: math.log(x / (1 - x))
+        self.q = torch.nn.ParameterDict({k: torch.nn.Parameter(torch.tensor(lgt(min(max((float(v[k]) - lo) / (hi - lo), 1e-3), 1 - 1e-3)), device=dev))
+                                         for k, (lo, hi) in self.BOUNDS.items()})
+
+    def forward(self):
+        return {k: (lo + (hi - lo) * torch.sigmoid(self.q[k])) if self.on[k] else torch.zeros((), device=self.q[k].device)
+                for k, (lo, hi) in self.BOUNDS.items()}
+
+    def values(self):
+        with torch.no_grad():
+            return {k: float(v) for k, v in self().items()}
+
+
+def decor_loss(o, K, zm=1.0, dcap=8.0, chroma=0.25, min_w=50.0):
+    """How much each body's paint follows the shading cues of its geometry, in one rendered frame o
+    (render(..., aux=True), B = 1): per body, the share-weighted correlation over its pixels between the
+    paint (luminance; chroma I, Q at weight --chroma) and the key light's n.l, the sky it sees (when
+    rendered with --sky), and its distance from the nearest outline (capped at dcap world px). Painted-in
+    shading and rim darkening correlate; a rainbow patch, or any pattern, laid on without regard to the
+    geometry does not. Returns the mean squared correlation (bodies weighted by min(px / 200, 1)) and the
+    signed mean correlation of the luminance with each cue."""
+    pix, obj, dev = o["pix"], o["obj"], o["alb"].device
+    w = (o["ep"][0] / o["den"][0][pix]).detach()
+    a_ = o["alb"][0]
+    ch = [(a_ @ torch.tensor([0.299, 0.587, 0.114], device=dev), 1.0), (a_ @ torch.tensor([0.596, -0.274, -0.322], device=dev), chroma),
+          (a_ @ torch.tensor([0.211, -0.523, 0.312], device=dev), chroma)]
+    H_ = W_ = int(round(math.sqrt(o["gown"].shape[1])))  # (square frames)
+    dist = outline_dist(o["ep"], pix, obj, 1, H_, W_, int(math.ceil(dcap * zm)) + 1, False, 1 - o["gown"])[0] / zm
+    cues = {"ndl": torch.relu((o["nk"][0].detach() * o["lvec"][0]).sum(-1)), "dist": dist[pix].clamp(max=dcap)}
+    if "sky" in o:
+        cues["sky"] = o["sky"][0][pix]
+    z = lambda: torch.zeros(K, device=dev)
+    Wk = z().index_add_(0, obj, w).clamp(min=1e-6)
+    m = lambda x: z().index_add_(0, obj, w * x) / Wk
+    bw = (Wk / 200).clamp(max=1) * (Wk > min_w).float()
+    tot, sig = 0, {}
+    for cn, c in cues.items():
+        c = c.detach()
+        cc = c - m(c)[obj]
+        vc = m(cc * cc)
+        for i, (x, wt) in enumerate(ch):
+            xc = x - m(x)[obj]
+            r = m(xc * cc) / torch.sqrt((m(xc * xc) + 1e-4) * (vc + 1e-6))
+            tot = tot + wt * (bw * r * r).sum() / bw.sum().clamp(min=1e-6)
+            if i == 0:
+                sig[cn] = float((bw * r).sum() / bw.sum().clamp(min=1e-6))
+    return tot / (len(cues) * (1 + 2 * chroma)), sig
 
 
 def render_ss(tb, sph, cam, pairs, light, a, **kw):
@@ -1975,6 +2108,12 @@ def main():
     ap.add_argument("--sky-pen", type=float, default=0.15, help="sky occlusion: penumbra growth per px of distance")
     ap.add_argument("--outline", type=float, default=0.0, help="drawn dark ring at every body boundary, strength (0 = off)")
     ap.add_argument("--outline-w", type=float, default=2.0, help="its falloff width, px")
+    ap.add_argument("--burn", type=float, default=0.0, help="dodge-and-burn layer: darkening at every projected outline, strength (0 = off)")
+    ap.add_argument("--burn-w", type=float, default=1.5, help="its falloff width, px")
+    ap.add_argument("--dodge", type=float, default=0.0, help="dodge-and-burn layer: a lightened ring inside every outline, strength")
+    ap.add_argument("--dodge-r", type=float, default=2.5, help="its distance from the outline, px")
+    ap.add_argument("--dodge-w", type=float, default=1.0, help="its width, px")
+    ap.add_argument("--crease", type=float, default=0.0, help="dodge-and-burn layer: screen-space crevice darkening from the depth, strength")
     ap.add_argument("--ao-dif", type=float, default=0.5, help="share of the occlusion applied to the key light too")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--load", help="tube.pt: start from these bodies and textures")

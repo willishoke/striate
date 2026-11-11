@@ -50,7 +50,9 @@ frame with the 4 fixed crops, and its visible ground (gaps) measured. --train N 
 under random frames of the loop (positions fixed, grads only into textures and ground). --train-sym p
 shows each body, with probability p per frame, rolled about its spine, mirrored and/or reversed end for
 end, so every side of its skin is judged as its top is; --caps disc converts a checkpoint's end caps
-(objtube.py) first.
+(objtube.py) first. --wdecor W charges paint that correlates with the shading cues of its geometry (n.l, sky, distance
+from the outline: painted-in shading), and --lr-burn learns objtube's dodge-and-burn layer (--burn ...), which
+then travels with the checkpoint as its render args, so the dark seams can come from a tunable layer instead.
 
 usage: objphys.py --load tube.pt --image still.png --target inception4c:7 --out DIR [--render] [--train N]
        Simulation runs on the CPU (no GPU lock needed with --sim-only); rendering and training need MPS.
@@ -66,7 +68,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z, with_dir, tex_span, convert_caps, roll_tile, spec_fill, patch_fill, carry
+from objtube import Mixed, Rig, Cam, build_pairs, render, render_ss, encode, rot_x, rot_z, with_dir, tex_span, convert_caps, roll_tile, spec_fill, patch_fill, carry, \
+    BurnLayer, BURN_KEYS, decor_loss
 
 
 # ---------------------------------------------------------------- physics (CPU, float64)
@@ -489,6 +492,17 @@ def main():
     ap.add_argument("--outline", type=float, default=None, help="objtube's drawn ring at every body boundary: strength (default: the checkpoint's)")
     ap.add_argument("--outline-w", type=float, default=2.0)
     ap.add_argument("--ao", type=float, default=None, help="ambient occlusion strength (default: the checkpoint's)")
+    ap.add_argument("--burn", type=float, default=None, help="objtube's dodge-and-burn layer: darkening at every projected outline (default: the checkpoint's)")
+    ap.add_argument("--burn-w", type=float, default=None, help="its falloff, px")
+    ap.add_argument("--dodge", type=float, default=None, help="dodge-and-burn: a lightened ring inside every outline, strength")
+    ap.add_argument("--dodge-r", type=float, default=None, help="its distance from the outline, px")
+    ap.add_argument("--dodge-w", type=float, default=None, help="its width, px")
+    ap.add_argument("--crease", type=float, default=None, help="dodge-and-burn: screen-space crevice darkening from the depth, strength")
+    ap.add_argument("--lr-burn", type=float, default=0.0, help="training: also learn the dodge-and-burn layer (from the values above, else the "
+                    "checkpoint's, else burn 0.3 w 1.5, dodge 0.05 at 2.5 w 1, crease 0.2; a part that starts at 0 stays off)")
+    ap.add_argument("--wdecor", type=float, default=0.0, help="training: cost of each body's paint correlating, over its pixels in a frame, with "
+                    "its geometry's shading cues (key n.l, sky seen, distance from the outline): shading belongs to the light and the burn layer")
+    ap.add_argument("--decor-chroma", type=float, default=0.25, help="--wdecor: weight of the paint's chroma (I, Q) beside its luminance")
     ap.add_argument("--lr-prior", type=float, default=0.0, help="also train the wrapped-still prior texture at this rate")
     ap.add_argument("--bump-amp", type=float, default=None, help="fine relief on the texture's grid, px (default: the checkpoint's; 0 off)")
     ap.add_argument("--bump-around", type=int, default=64)
@@ -548,6 +562,10 @@ def main():
             setattr(ta, n_, getattr(a, n_))
     if a.outline is not None:
         ta.outline, ta.outline_w = a.outline, a.outline_w
+    for n_ in BURN_KEYS:  # the dodge-and-burn layer: travels with the checkpoint, any part overridable here
+        if getattr(a, n_) is not None:
+            setattr(ta, n_, getattr(a, n_))
+            ck["args"] = {**ck["args"], n_: getattr(a, n_)}
     if a.bump_amp is not None:  # the relief's settings travel with the checkpoint, so it reloads with its relief
         ta.bump_amp, ta.bump_around, ta.bump_along = a.bump_amp, a.bump_around, a.bump_along
         ck["args"] = {**ck["args"], "bump_amp": a.bump_amp, "bump_around": a.bump_around, "bump_along": a.bump_along}
@@ -827,6 +845,12 @@ def main():
             groups.append({"params": [tb.tex0], "lr": a.lr_prior})
         if a.lr_bump > 0 and hasattr(tb, "bump") and skp is None:
             groups.append({"params": [tb.bump], "lr": a.lr_bump})
+        bl = None
+        if a.lr_burn > 0:
+            dflt = dict(burn=0.3, burn_w=1.5, dodge=0.05, dodge_r=2.5, dodge_w=1.0, crease=0.2)
+            bl = BurnLayer({n_: (getattr(ta, n_) if getattr(ta, n_, None) is not None else dflt[n_]) for n_ in BURN_KEYS}, dev)
+            groups.append({"params": list(bl.parameters()), "lr": a.lr_burn})
+            log(f"dodge-and-burn layer learns from {bl.values()}")
         if hasattr(tb, "capt"):  # the caps' discs learn as the paint (and relief) they continue
             groups.append({"params": [tb.capt], "lr": a.lr_prior if a.lr_prior > 0 else a.lr_tex})
             if a.lr_bump > 0 and hasattr(tb, "capb"):
@@ -943,17 +967,22 @@ def main():
             s1["Bv"] = torch.einsum("kij,bknj->bkni", Rs, s1["Bv"])
             cm = Cam(np.eye(3), G * cell, G * cell, (0.0, 0.0, 0.0), S, wrap=False, zoom=zm_)
             cm.env = True
-            o = render(tb, s1, cm, padded(build_pairs(s1, cm, 2.0)), [lt_], ta, aux=True, ground="none", sub=ks)
+            o = render(tb, s1, cm, padded(build_pairs(s1, cm, 2.0)), [lt_], ta, aux=True, ground="none", sub=ks, burn=bl() if bl is not None else None)
             own = o["ep"][0] / o["den"][0][o["pix"]]
             Y = (o["alb"][0] * torch.tensor([0.299, 0.587, 0.114], device=dev)).sum(-1)
             dark = (own * torch.relu(a.dark_floor - Y) ** 2).sum() / own.sum().clamp(min=1) / 0.01
+            dc_ = 0.0
+            if a.wdecor > 0:
+                dc_, sg_ = decor_loss(o, len(ks), zm=zm_, chroma=a.decor_chroma)
+                dlog.append((float(dc_), sg_))
             img = F.pad(o["img"], (0, S - G * cell, 0, S - G * cell))
-            return img, dark
+            return img, dark, dc_
 
         opt = torch.optim.Adam(groups)
         base = [g["lr"] for g in opt.param_groups]
         rng = random.Random(a.seed + 7)
         mlog = []  # --wmatch: the match term of each frame from below, between log lines
+        dlog = []  # --wdecor: the decorrelation term and the signed correlations, between log lines
         log(f"training textures under the loop: {a.train} steps, {a.mb} frames each")
         for it in range(a.train):
             for g, b in zip(opt.param_groups, base):
@@ -1008,9 +1037,9 @@ def main():
                     el_ = math.asin(max(-1.0, min(1.0, float(lt_["l"][2])))) - math.radians(rng.uniform(0, a.train_light / 2))
                     lt_ = with_dir(lt_, az_, max(el_, math.radians(15)))
                 if a.solo > 0 and rng.random() < a.solo:
-                    img_, dk_ = solo_mosaic(lt_)
+                    img_, dk_, dc_ = solo_mosaic(lt_)
                     acts.append(rg.act(MultiScaleCrop(224 / S, 512)(img_)))
-                    pens.append(a.wdark * dk_)
+                    pens.append(a.wdark * dk_ + a.wdecor * dc_)
                     ((-acts[-1] + acts[-1].detach().abs() * pens[-1]) / len(sps)).backward()
                     acts[-1], pens[-1] = acts[-1].detach(), pens[-1].detach()
                     if it == 0 or (it + 1) % 100 == 0:
@@ -1029,7 +1058,7 @@ def main():
                     sp["tex_shift"] = torch.stack([torch.rand(tb.K, device=dev) * pick, torch.zeros(tb.K, device=dev)], -1)
                     sgn = torch.where(torch.rand(tb.K, 2, device=dev) < 0.5, -1.0, 1.0)
                     sp["tex_sign"] = torch.where(pick[:, None] > 0, sgn, torch.ones_like(sgn))
-                o = render(tb, sp, cm, pr, [lt_], ta, aux=True, ground="none" if getattr(cm, "env", False) else "tex")
+                o = render(tb, sp, cm, pr, [lt_], ta, aux=True, ground="none" if getattr(cm, "env", False) else "tex", burn=bl() if bl is not None else None)
                 acts.append(rg.act(MultiScaleCrop(224 / S, 512)(o["img"])))
                 # paint may not do the geometry's job: no texture darker than --dark-floor, and none darker
                 # toward a body's limb than 75% of its front (objtube.py's rim term)
@@ -1043,6 +1072,10 @@ def main():
                 rim = (band * torch.relu(0.75 * refY.detach()[obj] - Y) ** 2).sum() / band.sum().clamp(min=1) / 0.01
                 dark = (own * torch.relu(a.dark_floor - Y) ** 2).sum() / own.sum().clamp(min=1) / 0.01
                 pens.append(a.wrim * rim + a.wdark * dark)
+                if a.wdecor > 0:  # paint that follows the shading cues is shading painted in
+                    dc_, sg_ = decor_loss(o, tb.K, zm=getattr(cm, "zoom", 1.0), chroma=a.decor_chroma)
+                    pens[-1] = pens[-1] + a.wdecor * dc_
+                    dlog.append((float(dc_), sg_))
                 if a.wmatch > 0 and getattr(cm, "env", False) and cm.R[2, 2] < 0:  # seen from below: undersides as their tops
                     mb_, Wb_ = body_lum_stats(Y, own, obj, tb.K)
                     ok_ = (Wt_ > 30).float() * (Wb_ / 500).clamp(max=1)  # a glimpse of a body counts for less
@@ -1072,12 +1105,15 @@ def main():
             opt.step()
             if it % 25 == 0 or it == a.train - 1:
                 log(f"step {it + 1}/{a.train} act {float(act):.3f} pen {float(pen):.3f}" + (f" skin {float(sk):.3f}" if a.wskin > 0 else "") + (f" kl {float(kl_):.3f}" if skp is not None else "")
-                    + (f" match {np.mean(mlog):.3f}" if mlog else "") + f" (frames {ts})")
-                mlog = []
+                    + (f" match {np.mean(mlog):.3f}" if mlog else "") + f" (frames {ts})"
+                    + (f" decor {np.mean([d_[0] for d_ in dlog]):.4f} corr " + " ".join(f"{c_} {np.mean([d_[1][c_] for d_ in dlog if c_ in d_[1]]):+.3f}" for c_ in dlog[0][1]) if dlog else "")
+                    + (" burn " + " ".join(f"{k_} {v_:.3f}" for k_, v_ in bl.values().items()) if bl is not None else ""))
+                mlog, dlog = [], []
                 if str(dev).startswith("mps"):
                     torch.mps.empty_cache()
             if (it + 1) % 100 == 0 and it + 1 < a.train:  # a crash late in a run keeps most of it
-                torch.save({**ck, "tubes": {**ck["tubes"], **{k: v.detach().cpu() for k, v in tb.state_dict().items()}}}, f"{a.out}/tube_partial.pt")
+                torch.save({**ck, "tubes": {**ck["tubes"], **{k: v.detach().cpu() for k, v in tb.state_dict().items()}},
+                            **({"args": {**ck["args"], **bl.values()}} if bl is not None else {})}, f"{a.out}/tube_partial.pt")
         if grower is not None:
             torch.save(dict(cfg=grower.cfg, state={k: v.detach().cpu() for k, v in grower.state_dict().items()}), f"{a.out}/grow.pt")
             with torch.no_grad():
@@ -1090,6 +1126,12 @@ def main():
         ck2 = dict(ck)
         ck2["tubes"] = {**ck["tubes"], **{k: v.detach().cpu() for k, v in tb.state_dict().items()}}
         ck2["phys_train"] = vars(a)
+        if bl is not None:  # the learned layer's values become the checkpoint's render args (overridable with --burn ...)
+            for k_, v_ in bl.values().items():
+                setattr(ta, k_, v_)
+            ck2["args"] = {**ck2["args"], **bl.values()}
+            rep["burn"] = bl.values()
+            log(f"dodge-and-burn learned: {bl.values()}")
         if skp is not None:
             ck2["skin_prior"] = dict(model=a.skin_prior, **skp.state())
         torch.save(ck2, f"{a.out}/tube.pt")
