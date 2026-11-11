@@ -1349,6 +1349,7 @@ def shadow(X, n, l, sph, S, wrap, pen0, pen, H, W, ts=16, tchunk=128):
                 ok &= ((c2 + rr + marg) > p2.min(1, keepdim=True)[0]) & ((c2 - rr - marg) < p2.max(1, keepdim=True)[0])
                 ok &= (cl + rr) > (rel @ ld).min(1, keepdim=True)[0]
                 M = max(1, int(ok.sum(1).max()))
+                M = min(C.shape[0], -(-M // 32) * 32)  # in steps of 32 (val 0 past the candidates): each new M is a new graph on MPS
             if n_ == 1 or n_ * ts * ts * M <= budget:
                 break
             n_ = max(1, n_ // 2)
@@ -1802,7 +1803,7 @@ def render(tb, sph, cam, pairs, lights, a, clay=None, shadows=True, ground="tex"
         # (and depth), so it follows the bodies and can be retuned at render time
         top_down = cam.wrap and np.allclose(cam.R, np.eye(3))
         reach = max(float(bn["burn_w"]) * 4, float(bn["dodge_r"]) + 2.5 * float(bn["dodge_w"]))
-        dist = outline_dist(ep, pix, obj, B, H, W, int(math.ceil(min(reach, 20.0) * zm)), top_down, cover)
+        dist = outline_dist(ep, pix, obj, B, H, W, int(math.ceil(min(reach, 20.0) * zm / 4)) * 4, top_down, cover)
         img = burn_layer(img, dist / zm, bn, wc.reshape(B, 1, H, W) if float(bn["crease"]) > 0 else None, zm, top_down)
     img = img.clamp(0, 1)
     if not aux:
@@ -1864,10 +1865,10 @@ def outline_dist(ep, pix, obj, B, H, W, dmax, wrap, cover=None):
     for b in range(B):
         best = torch.full((H * W,), -1.0, device=ep.device).scatter_reduce(0, pix, ep[b], "amax", include_self=True)
         win = (ep[b] >= best[pix] - 1e-12) & (ep[b] > 1e-6)
-        idm = torch.full((H * W,), -1.0, device=ep.device)
-        idm[pix[win]] = obj[win].float()
+        # (scattered, not mask-indexed: a shape per frame is a graph per frame on MPS)
+        idm = torch.full((H * W,), -1.0, device=ep.device).scatter_reduce(0, pix, torch.where(win, obj.float(), -1.0), "amax", include_self=True)
         if cover is not None:
-            idm[cover[b] < 0.5] = -1.0
+            idm = torch.where(cover[b] < 0.5, -1.0, idm)
         p = F.pad(idm.reshape(1, 1, H, W), (1, 1, 1, 1), mode=mode)[0, 0]
         c = p[1:-1, 1:-1]
         E = ((c != p[:-2, 1:-1]) | (c != p[2:, 1:-1]) | (c != p[1:-1, :-2]) | (c != p[1:-1, 2:])).float()[None, None]
@@ -1907,9 +1908,10 @@ def burn_layer(img, d, bn, wc, zm, wrap):
         img = img + ring * (1 - img.clamp(max=1))
     if wc is not None:
         acc = 0
-        for rr in [max(1, int(round(q * zm))) for q in (3, 6, 12)]:
+        zq = 2.0 ** round(math.log2(zm))  # radii on a few sizes only (each new size is a new graph on MPS)
+        for rr in [max(1, int(round(q * zq))) for q in (3, 6, 12)]:
             bl = F.avg_pool2d(F.pad(wc.detach(), (rr, rr, rr, rr), mode="circular" if wrap else "replicate"), 2 * rr + 1, stride=1)
-            acc = acc + torch.relu(bl - wc.detach()) / (rr / zm)
+            acc = acc + torch.relu(bl - wc.detach()) / (rr / zq)
         img = img * torch.exp(-bn["crease"] * acc)
     return img
 
